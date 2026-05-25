@@ -34,7 +34,7 @@ export function ManageBillingButton({
   const className =
     variant === "primary"
       ? "rounded-lg bg-brand-600 px-4 py-2 text-sm font-semibold text-white transition hover:bg-brand-500 disabled:opacity-60"
-      : "rounded-lg border border-white/10 px-4 py-2 text-sm text-white transition hover:bg-white/5 disabled:opacity-60";
+      : "rounded-lg border border-slate-200 bg-white px-4 py-2 text-sm font-medium text-slate-700 shadow-sm transition hover:bg-slate-50 hover:text-slate-900 disabled:opacity-60 dark:border-white/10 dark:bg-transparent dark:text-white dark:shadow-none dark:hover:bg-white/5";
 
   return (
     <div className="flex flex-col items-start gap-1">
