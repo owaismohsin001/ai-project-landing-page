@@ -6,6 +6,7 @@ import type { Config } from "tailwindcss";
  */
 const config: Config = {
   content: ["./src/**/*.{ts,tsx}"],
+  darkMode: "class",
   theme: {
     extend: {
       colors: {
@@ -33,9 +34,39 @@ const config: Config = {
           "0%": { opacity: "0", transform: "translateY(16px)" },
           "100%": { opacity: "1", transform: "translateY(0)" },
         },
+        shimmer: {
+          "0%": { transform: "translateX(0%)" },
+          "100%": { transform: "translateX(400%)" },
+        },
+        "draw-circle": {
+          "0%": { strokeDashoffset: "166" },
+          "100%": { strokeDashoffset: "0" },
+        },
+        "draw-check": {
+          "0%": { strokeDashoffset: "48" },
+          "100%": { strokeDashoffset: "0" },
+        },
+        "pop-in": {
+          "0%": { opacity: "0", transform: "scale(0.6)" },
+          "60%": { opacity: "1", transform: "scale(1.08)" },
+          "100%": { opacity: "1", transform: "scale(1)" },
+        },
+        "fade-in": {
+          "0%": { opacity: "0" },
+          "100%": { opacity: "1" },
+        },
+        "modal-in": {
+          "0%": { opacity: "0", transform: "scale(0.92) translateY(8px)" },
+          "100%": { opacity: "1", transform: "scale(1) translateY(0)" },
+        },
       },
       animation: {
         "fade-up": "fade-up 0.6s ease-out both",
+        "draw-circle": "draw-circle 500ms ease-out forwards",
+        "draw-check": "draw-check 350ms ease-out 450ms forwards",
+        "pop-in": "pop-in 250ms ease-out both",
+        "fade-in": "fade-in 200ms ease-out both",
+        "modal-in": "modal-in 220ms cubic-bezier(0.16,1,0.3,1) both",
       },
     },
   },
