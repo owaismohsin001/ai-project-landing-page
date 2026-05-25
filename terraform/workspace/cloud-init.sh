@@ -14,6 +14,8 @@
 #   4. Configures code-server to bind 0.0.0.0:8080 with auth disabled
 #   5. Creates systemd services for backend + frontend + code-server so
 #      everything auto-starts on boot
+#   6. Installs Docker Engine + runs a Playwright (+ Chromium) container
+#      named 'ai-ide-playwright' for tests / AI-driven browser automation
 #
 # Usage (paste into EC2 user-data field at instance launch):
 #   #!/bin/bash
@@ -74,14 +76,39 @@ readonly CODE_SERVER_PORT=8080
 readonly LOG_FILE="/var/log/ai-ide-install.log"
 
 # ────────────────────────────────────────────────────────────────────
-# Logging — tee everything to both console and log file
+# Logging — tee everything to both console and log file, with colors
 # ────────────────────────────────────────────────────────────────────
 
 mkdir -p "$(dirname "$LOG_FILE")"
 exec > >(tee -a "$LOG_FILE") 2>&1
 
-log() { echo "[$(date '+%H:%M:%S')] $*"; }
-hdr() { echo; echo "═══ $* ═══"; }
+# Color codes (work in cloud-init output, `tail -f`, journalctl, and most
+# terminals). If TERM is "dumb" or we're not on a tty, the escapes still
+# render fine when viewed with `less -R` or `cat`.
+RED=$'\033[0;31m'
+GREEN=$'\033[0;32m'
+YELLOW=$'\033[1;33m'
+BLUE=$'\033[0;34m'
+CYAN=$'\033[0;36m'
+MAGENTA=$'\033[0;35m'
+BOLD=$'\033[1m'
+DIM=$'\033[2m'
+NC=$'\033[0m'
+
+ts()    { date '+%H:%M:%S'; }
+log()   { echo "${BLUE}▸${NC} ${DIM}[$(ts)]${NC} $*"; }
+ok()    { echo "${GREEN}✓${NC} ${DIM}[$(ts)]${NC} ${GREEN}$*${NC}"; }
+warn()  { echo "${YELLOW}!${NC} ${DIM}[$(ts)]${NC} ${YELLOW}$*${NC}"; }
+err()   { echo "${RED}✗${NC} ${DIM}[$(ts)]${NC} ${RED}$*${NC}" >&2; }
+skip()  { echo "${YELLOW}~${NC} ${DIM}[$(ts)]${NC} $* ${DIM}(skipped — already present)${NC}"; }
+hdr()   { echo; echo "${BOLD}${CYAN}═══════════════════════════════════════════════${NC}"; \
+          echo "${BOLD}${CYAN}  $*${NC}"; \
+          echo "${BOLD}${CYAN}═══════════════════════════════════════════════${NC}"; }
+done_step() { echo "${BOLD}${GREEN}── ✓ Step complete — $* ──${NC}"; echo; }
+
+# Pipe output of slow commands through this to indent + dim, so users
+# watching `tail -f` can see progress without it overwhelming the log.
+indent() { sed "s/^/    ${DIM}│${NC} /"; }
 
 # ────────────────────────────────────────────────────────────────────
 # Pre-flight — must be root + Ubuntu
@@ -129,77 +156,86 @@ as_user() {
 hdr "Step 0 — Swap (avoids OOM during npm install on small instances)"
 
 if swapon --show | grep -q .; then
-  log "swap already active — skipping"
+  skip "swap already active"
 else
   log "Creating 2 GB /swapfile"
   fallocate -l 2G /swapfile
   chmod 600 /swapfile
-  mkswap /swapfile >/dev/null
+  mkswap /swapfile 2>&1 | indent
   swapon /swapfile
   # Persist across reboots.
   if ! grep -q '^/swapfile' /etc/fstab; then
     echo '/swapfile none swap sw 0 0' >> /etc/fstab
   fi
+  ok "2 GB swap activated and persisted in /etc/fstab"
 fi
-free -h
+free -h | indent
+done_step "Step 0 — Swap"
 
 # ────────────────────────────────────────────────────────────────────
-# Step 1 / 7 — apt base packages
+# Step 1 / 8 — apt base packages
 # ────────────────────────────────────────────────────────────────────
 
-hdr "Step 1 / 7 — apt base packages"
+hdr "Step 1 / 8 — apt base packages"
 
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq
+
+log "Refreshing apt package index"
+apt-get update 2>&1 | indent
+
+log "Installing: curl, ca-certificates, gnupg, git, build-essential, python3, unzip"
 apt-get install -y \
   curl ca-certificates gnupg git \
-  build-essential python3 unzip \
-  >/dev/null
+  build-essential python3 unzip 2>&1 | indent
 
-log "✓ Base packages installed"
+ok "Base packages installed"
+done_step "Step 1 / 8 — apt base packages"
 
 # ────────────────────────────────────────────────────────────────────
-# Step 2 / 7 — Node.js 20 LTS
+# Step 2 / 8 — Node.js 20 LTS
 # ────────────────────────────────────────────────────────────────────
 
-hdr "Step 2 / 7 — Node.js ${NODE_MAJOR} LTS"
+hdr "Step 2 / 8 — Node.js ${NODE_MAJOR} LTS"
 
 if command -v node >/dev/null && [ "$(node -v | sed -E 's/^v([0-9]+)\..*/\1/')" -ge "$NODE_MAJOR" ]; then
-  log "node $(node -v) already installed — skipping"
+  skip "node $(node -v) already installed"
 else
-  log "Adding NodeSource repo and installing Node ${NODE_MAJOR}.x"
-  curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR}.x" | bash -
-  apt-get install -y nodejs >/dev/null
+  log "Adding NodeSource APT repo for Node ${NODE_MAJOR}.x"
+  curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR}.x" | bash - 2>&1 | indent
+  log "Installing nodejs package"
+  apt-get install -y nodejs 2>&1 | indent
 fi
 
-log "✓ node $(node -v) / npm $(npm -v)"
+ok "node $(node -v) / npm $(npm -v) ready"
+done_step "Step 2 / 8 — Node.js"
 
 # ────────────────────────────────────────────────────────────────────
-# Step 3 / 7 — Claude Code CLI
+# Step 3 / 8 — Claude Code CLI
 # ────────────────────────────────────────────────────────────────────
 
-hdr "Step 3 / 7 — Claude Code CLI"
+hdr "Step 3 / 8 — Claude Code CLI"
 
 if command -v claude >/dev/null; then
-  log "claude already installed — skipping"
+  skip "claude already installed"
 else
-  log "Installing @anthropic-ai/claude-code globally"
-  npm install -g @anthropic-ai/claude-code
+  log "Downloading @anthropic-ai/claude-code from npm (this can take ~30s)"
+  npm install -g @anthropic-ai/claude-code 2>&1 | indent
 fi
 
-log "✓ claude $(claude --version 2>/dev/null | head -1 || echo unknown)"
+ok "claude $(claude --version 2>/dev/null | head -1 || echo unknown)"
+done_step "Step 3 / 8 — Claude Code CLI"
 
 # ────────────────────────────────────────────────────────────────────
-# Step 4 / 7 — code-server
+# Step 4 / 8 — code-server
 # ────────────────────────────────────────────────────────────────────
 
-hdr "Step 4 / 7 — code-server (VS Code in browser)"
+hdr "Step 4 / 8 — code-server (VS Code in browser)"
 
 if command -v code-server >/dev/null; then
-  log "code-server already installed — skipping"
+  skip "code-server already installed"
 else
-  log "Running official code-server install script"
-  curl -fsSL https://code-server.dev/install.sh | sh
+  log "Downloading + installing code-server (official install script)"
+  curl -fsSL https://code-server.dev/install.sh | sh 2>&1 | indent
 fi
 
 log "Writing code-server config (bind 0.0.0.0:${CODE_SERVER_PORT}, auth=none)"
@@ -211,37 +247,39 @@ cert: false
 EOF
 chown -R "${TARGET_USER}:${TARGET_USER}" "${TARGET_HOME}/.config"
 
-log "✓ code-server $(code-server --version 2>/dev/null | head -1)"
+ok "code-server $(code-server --version 2>/dev/null | head -1) ready"
+done_step "Step 4 / 8 — code-server"
 
 # ────────────────────────────────────────────────────────────────────
-# Step 5 / 7 — Clone repos
+# Step 5 / 8 — Clone repos
 # ────────────────────────────────────────────────────────────────────
 
-hdr "Step 5 / 7 — Clone backend + frontend repos"
+hdr "Step 5 / 8 — Clone backend + frontend repos"
 
 as_user mkdir -p "$PROJECT_DIR"
 
 clone_or_pull() {
   local repo_url="$1" target_dir="$2" name="$3"
   if [ -d "${target_dir}/.git" ]; then
-    log "${name}: existing checkout found — git pull"
-    as_user git -C "$target_dir" pull --ff-only
+    log "${name}: existing checkout found — git pull --ff-only"
+    as_user git -C "$target_dir" pull --ff-only 2>&1 | indent
   else
     log "${name}: cloning from ${repo_url}"
-    as_user git clone --depth=1 "$repo_url" "$target_dir"
+    as_user git clone --depth=1 "$repo_url" "$target_dir" 2>&1 | indent
   fi
 }
 
 clone_or_pull "$REPO_BACKEND"  "${PROJECT_DIR}/backend"  "backend"
 clone_or_pull "$REPO_FRONTEND" "${PROJECT_DIR}/frontend" "frontend"
 
-log "✓ Both repos checked out under ${PROJECT_DIR}"
+ok "Both repos checked out under ${PROJECT_DIR}"
+done_step "Step 5 / 8 — Clone repos"
 
 # ────────────────────────────────────────────────────────────────────
-# Step 6 / 7 — npm install (frontend + backend)
+# Step 6 / 8 — npm install (frontend + backend)
 # ────────────────────────────────────────────────────────────────────
 
-hdr "Step 6 / 7 — npm install (this can take a few minutes)"
+hdr "Step 6 / 8 — npm install (this can take 2-5 minutes)"
 
 # Both repos pin the China npm mirror (registry.npmmirror.com) in their
 # .npmrc and in lockfile `resolved` URLs. That mirror returns 503 constantly
@@ -258,19 +296,21 @@ done
 
 NPM_FLAGS="--no-fund --no-audit --registry=https://registry.npmjs.org"
 
-log "backend: npm install"
-as_user bash -lc "cd ${PROJECT_DIR}/backend && npm install $NPM_FLAGS"
+log "backend: npm install (downloading packages...)"
+as_user bash -lc "cd ${PROJECT_DIR}/backend && npm install $NPM_FLAGS" 2>&1 | indent
+ok "backend dependencies installed"
 
-log "frontend: npm install"
-as_user bash -lc "cd ${PROJECT_DIR}/frontend && npm install $NPM_FLAGS"
+log "frontend: npm install (downloading packages...)"
+as_user bash -lc "cd ${PROJECT_DIR}/frontend && npm install $NPM_FLAGS" 2>&1 | indent
+ok "frontend dependencies installed"
 
-log "✓ Dependencies installed"
+done_step "Step 6 / 8 — npm install"
 
 # ────────────────────────────────────────────────────────────────────
-# Step 7 / 7 — systemd services
+# Step 7 / 8 — systemd services
 # ────────────────────────────────────────────────────────────────────
 
-hdr "Step 7 / 7 — systemd services (backend + frontend + code-server)"
+hdr "Step 7 / 8 — systemd services (backend + frontend + code-server)"
 
 # --- Backend service ---
 # Pulls INSTANCE_ID / INSTANCE_IP / INSTANCE_URL / BUCKET_ID / AWS_REGION /
@@ -357,8 +397,112 @@ systemctl enable --now ai-ide-frontend
 sleep 5
 for svc in "code-server@${TARGET_USER}" ai-ide-backend ai-ide-frontend; do
   state=$(systemctl is-active "$svc" || true)
-  log "  ${svc}: ${state}"
+  if [ "$state" = "active" ]; then
+    ok "  ${svc}: ${state}"
+  else
+    warn "  ${svc}: ${state}"
+  fi
 done
+
+done_step "Step 7 / 8 — systemd services"
+
+# ────────────────────────────────────────────────────────────────────
+# Step 8 / 8 — Docker + Playwright (+ Chromium) container
+# ────────────────────────────────────────────────────────────────────
+#
+# Installs Docker Engine via the official Docker apt repo, then runs a
+# Playwright container (Chromium + Firefox + WebKit pre-installed) named
+# `ai-ide-playwright`. The container stays up across reboots so the AI
+# panel can drive browsers / run tests on demand.
+#
+# Self-contained: the docker-compose.yml is written inline so this step
+# doesn't depend on cloning the AI-IDE meta-repo.
+
+hdr "Step 8 / 8 — Docker + Playwright + Chromium container"
+
+readonly PLAYWRIGHT_DIR="${PROJECT_DIR}/playwright"
+readonly PLAYWRIGHT_IMAGE="mcr.microsoft.com/playwright:v1.49.0-jammy"
+readonly PLAYWRIGHT_CONTAINER="ai-ide-playwright"
+
+# --- 8a. Install Docker Engine if missing ---
+if command -v docker >/dev/null && docker info >/dev/null 2>&1; then
+  skip "Docker already installed and reachable ($(docker --version))"
+else
+  log "Adding Docker's official APT keyring"
+  install -m 0755 -d /etc/apt/keyrings
+  curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+    | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+  chmod a+r /etc/apt/keyrings/docker.gpg
+
+  log "Adding Docker APT repository for ${VERSION_CODENAME:-$(. /etc/os-release && echo "$VERSION_CODENAME")}"
+  echo \
+    "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
+https://download.docker.com/linux/ubuntu \
+$(. /etc/os-release && echo "$VERSION_CODENAME") stable" \
+    > /etc/apt/sources.list.d/docker.list
+
+  log "Refreshing apt index for Docker packages"
+  apt-get update 2>&1 | indent
+
+  log "Installing: docker-ce, docker-ce-cli, containerd.io, docker-buildx-plugin, docker-compose-plugin"
+  apt-get install -y \
+    docker-ce docker-ce-cli containerd.io \
+    docker-buildx-plugin docker-compose-plugin 2>&1 | indent
+
+  log "Enabling docker.service"
+  systemctl enable --now docker
+
+  log "Adding ${TARGET_USER} to the 'docker' group (so it can run docker without sudo)"
+  usermod -aG docker "$TARGET_USER" || true
+
+  ok "Docker installed: $(docker --version)"
+fi
+
+# --- 8b. Write the docker-compose.yml (inline, self-contained) ---
+log "Writing Playwright docker-compose.yml at ${PLAYWRIGHT_DIR}/docker-compose.yml"
+as_user mkdir -p "$PLAYWRIGHT_DIR"
+cat > "${PLAYWRIGHT_DIR}/docker-compose.yml" <<EOF
+services:
+  playwright:
+    image: ${PLAYWRIGHT_IMAGE}
+    container_name: ${PLAYWRIGHT_CONTAINER}
+    restart: unless-stopped
+    shm_size: 2gb
+    volumes:
+      - ${PROJECT_DIR}:/work
+    working_dir: /work
+    command: sleep infinity
+EOF
+chown -R "${TARGET_USER}:${TARGET_USER}" "$PLAYWRIGHT_DIR"
+ok "docker-compose.yml written"
+
+# --- 8c. Pull the image (large download — show progress) ---
+log "Pulling ${PLAYWRIGHT_IMAGE} (~1.6 GB — first time only, this may take 2-4 min)"
+log "${DIM}Each layer line below = ~MB of download progress.${NC}"
+docker pull "$PLAYWRIGHT_IMAGE" 2>&1 | indent
+ok "Image pulled"
+
+# --- 8d. Start the container ---
+if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$PLAYWRIGHT_CONTAINER"; then
+  skip "Container '${PLAYWRIGHT_CONTAINER}' already running"
+else
+  log "Starting container '${PLAYWRIGHT_CONTAINER}'"
+  docker compose -f "${PLAYWRIGHT_DIR}/docker-compose.yml" up -d 2>&1 | indent
+fi
+
+# --- 8e. Verify container is actually up and Playwright works ---
+sleep 2
+if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$PLAYWRIGHT_CONTAINER"; then
+  pw_version=$(docker exec "$PLAYWRIGHT_CONTAINER" npx playwright --version 2>/dev/null || echo "unknown")
+  ok "Container '${PLAYWRIGHT_CONTAINER}' is running — ${pw_version}"
+  log "Try:  docker exec -it ${PLAYWRIGHT_CONTAINER} npx playwright --version"
+  log "Test: docker exec -it ${PLAYWRIGHT_CONTAINER} npx playwright open https://example.com"
+else
+  err "Container '${PLAYWRIGHT_CONTAINER}' didn't start. Inspect with:"
+  err "    docker compose -f ${PLAYWRIGHT_DIR}/docker-compose.yml logs"
+fi
+
+done_step "Step 8 / 8 — Playwright Docker container"
 
 # ────────────────────────────────────────────────────────────────────
 # Make sure .claude/skills dir exists for future skill installs
@@ -488,6 +632,44 @@ in an iframe) break inside the workspace. When scaffolding auth, prefer:
 Warn the user explicitly if a chosen auth provider refuses iframe
 embedding (Google's OAuth screen does, Auth0's does too by default).
 
+# E2E testing with Playwright (Docker)
+
+This workspace has a long-running Docker container named
+\`ai-ide-playwright\` with Playwright + Chromium + Firefox + WebKit
+pre-installed. Use it for end-to-end tests and browser automation.
+
+## When to run E2E tests — project completion rule (DEFAULT, not opt-in)
+
+**After you finish a user-visible change to a project** — built a new
+page, added a form, wired up auth, fixed a UI bug, anything the user
+would interact with in a browser — you MUST run a Playwright E2E test
+against what you built BEFORE telling the user "done".
+
+**Do this even when the user did NOT ask for tests.** E2E verification
+on completion is the default behavior of this workspace.
+
+Skip only when: pure backend work with no UI, doc/config tweaks,
+one-shot scripts, user explicitly says "don't test", or the feature
+can't be tested headlessly.
+
+## How to run
+
+Always exec inside the container (the host may not have browsers / OS deps):
+
+\`\`\`bash
+docker exec -w /work/<subfolder> ai-ide-playwright \\
+  npm init playwright@latest -- --quiet --browser=chromium --lang=ts
+docker exec -w /work/<subfolder> ai-ide-playwright npx playwright test
+\`\`\`
+
+Reach host services via \`host.docker.internal\` instead of \`localhost\`.
+For services exposed through the workspace proxy, use the public proxy
+URL instead — it works from inside the container too.
+
+If \`docker exec ai-ide-playwright …\` errors with "no such container",
+bring it back up:
+\`docker compose -f ${PROJECT_DIR}/playwright/docker-compose.yml up -d\`
+
 # Environment packs (installed skills)
 
 This workspace has user-installed environment packs at \`~/.claude/skills/\`.
@@ -533,7 +715,7 @@ chown "${TARGET_USER}:${TARGET_USER}" "${TARGET_HOME}/.claude/CLAUDE.md"
 # Final summary
 # ────────────────────────────────────────────────────────────────────
 
-hdr "All done"
+hdr "All done — AI-IDE Studio is up"
 
 # Public IP is exported by user-data.sh.tftpl (which already queries IMDSv2
 # during bootstrap). Fall back to a placeholder only if this script is run
@@ -542,38 +724,45 @@ PUBLIC_IP="${PUBLIC_IP:-<EC2_PUBLIC_IP>}"
 
 cat <<EOF
 
-  ✓ AI-IDE Studio is up on this EC2 instance.
+  ${BOLD}${GREEN}✓ AI-IDE Studio is up on this EC2 instance.${NC}
 
-  Public endpoints (via the central edge proxy + per-user Traefik on :80):
-    • Frontend:    ${PLATFORM_PROTOCOL:-http}://frontend-${USER_ID:-<USER_ID>}.${PLATFORM_DOMAIN:-<PLATFORM_DOMAIN>}/
-    • Backend API: ${PLATFORM_PROTOCOL:-http}://api-${USER_ID:-<USER_ID>}.${PLATFORM_DOMAIN:-<PLATFORM_DOMAIN>}/
-    • code-server: ${PLATFORM_PROTOCOL:-http}://ide-${USER_ID:-<USER_ID>}.${PLATFORM_DOMAIN:-<PLATFORM_DOMAIN>}/   (NO password!)
+  ${BOLD}Public endpoints${NC} (via the central edge proxy + per-user Traefik on :80):
+    ${GREEN}•${NC} Frontend:    ${CYAN}${PLATFORM_PROTOCOL:-http}://frontend-${USER_ID:-<USER_ID>}.${PLATFORM_DOMAIN:-<PLATFORM_DOMAIN>}/${NC}
+    ${GREEN}•${NC} Backend API: ${CYAN}${PLATFORM_PROTOCOL:-http}://api-${USER_ID:-<USER_ID>}.${PLATFORM_DOMAIN:-<PLATFORM_DOMAIN>}/${NC}
+    ${GREEN}•${NC} code-server: ${CYAN}${PLATFORM_PROTOCOL:-http}://ide-${USER_ID:-<USER_ID>}.${PLATFORM_DOMAIN:-<PLATFORM_DOMAIN>}/${NC}   ${YELLOW}(NO password!)${NC}
 
-  Internal ports (bypass Traefik, useful only for SSH debugging):
-    • Frontend → 127.0.0.1:${FRONTEND_PORT}
-    • Backend  → 127.0.0.1:${BACKEND_PORT}
-    • code-server → 127.0.0.1:${CODE_SERVER_PORT}
-    • Direct EC2 IP: ${PUBLIC_IP}
+  ${BOLD}Internal ports${NC} (bypass Traefik, useful only for SSH debugging):
+    ${GREEN}•${NC} Frontend → ${CYAN}127.0.0.1:${FRONTEND_PORT}${NC}
+    ${GREEN}•${NC} Backend  → ${CYAN}127.0.0.1:${BACKEND_PORT}${NC}
+    ${GREEN}•${NC} code-server → ${CYAN}127.0.0.1:${CODE_SERVER_PORT}${NC}
+    ${GREEN}•${NC} Direct EC2 IP: ${CYAN}${PUBLIC_IP}${NC}
 
-  Service controls (run on the EC2 instance):
-    sudo systemctl status  ai-ide-backend
-    sudo systemctl restart ai-ide-frontend
-    sudo journalctl -u ai-ide-backend -f
-    sudo journalctl -u ai-ide-frontend -f
-    sudo journalctl -u code-server@${TARGET_USER} -f
+  ${BOLD}Playwright + Chromium${NC} (Docker container — for tests / AI panel):
+    ${GREEN}•${NC} Container:   ${CYAN}${PLAYWRIGHT_CONTAINER}${NC}
+    ${GREEN}•${NC} Compose:     ${CYAN}${PLAYWRIGHT_DIR}/docker-compose.yml${NC}
+    ${GREEN}•${NC} Try:         ${DIM}docker exec -it ${PLAYWRIGHT_CONTAINER} npx playwright --version${NC}
+    ${GREEN}•${NC} Run a test:  ${DIM}docker exec -it ${PLAYWRIGHT_CONTAINER} npx playwright test${NC}
 
-  Install log: ${LOG_FILE}
+  ${BOLD}Service controls${NC} (run on the EC2 instance):
+    ${DIM}sudo systemctl status  ai-ide-backend${NC}
+    ${DIM}sudo systemctl restart ai-ide-frontend${NC}
+    ${DIM}sudo journalctl -u ai-ide-backend -f${NC}
+    ${DIM}sudo journalctl -u ai-ide-frontend -f${NC}
+    ${DIM}sudo journalctl -u code-server@${TARGET_USER} -f${NC}
+    ${DIM}docker logs -f ${PLAYWRIGHT_CONTAINER}${NC}
 
-  ⚠ SECURITY WARNING
+  ${BOLD}Install log:${NC} ${CYAN}${LOG_FILE}${NC}
+
+  ${BOLD}${YELLOW}⚠ SECURITY WARNING${NC}
     code-server is publicly exposed on port ${CODE_SERVER_PORT} without
     authentication. Anyone reaching this IP has a root shell. Either:
-      - Restrict EC2 Security Group inbound to your IP only, OR
-      - Enable auth: edit ${TARGET_HOME}/.config/code-server/config.yaml
-        and run 'sudo systemctl restart code-server@${TARGET_USER}'.
+      ${YELLOW}-${NC} Restrict EC2 Security Group inbound to your IP only, OR
+      ${YELLOW}-${NC} Enable auth: edit ${TARGET_HOME}/.config/code-server/config.yaml
+        and run ${DIM}'sudo systemctl restart code-server@${TARGET_USER}'${NC}.
 
-  Claude skills are NOT pre-installed. After SSH'ing in, either:
-    - Copy your skills folder to ${TARGET_HOME}/.claude/skills/, OR
-    - Tell Claude in chat: "Create a pack for <platform>" — the
+  ${BOLD}Claude skills are NOT pre-installed.${NC} After SSH'ing in, either:
+    ${GREEN}-${NC} Copy your skills folder to ${CYAN}${TARGET_HOME}/.claude/skills/${NC}, OR
+    ${GREEN}-${NC} Tell Claude in chat: "Create a pack for <platform>" — the
       create-platform-pack meta-skill will scaffold it (if it exists).
 
 EOF
