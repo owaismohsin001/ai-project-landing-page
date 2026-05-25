@@ -1,0 +1,14 @@
+{
+  "name": "workspace-server",
+  "version": "1.0.0",
+  "description": "Workspace HTTP server — EBS backup/restore for the host EC2.",
+  "type": "module",
+  "main": "server.js",
+  "private": true,
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@aws-sdk/client-ec2": "^3.700.0"
+  }
+}

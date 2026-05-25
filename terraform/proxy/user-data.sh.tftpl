@@ -1,0 +1,117 @@
+#!/bin/bash
+# Central edge proxy bootstrap.
+#
+# Installs three things:
+#   1. Docker + Traefik v3 (static config baked into the AMI's /etc/traefik)
+#   2. Node.js 20 + the traefik-router service on :${router_port}
+#   3. Systemd units for both so they survive reboot
+#
+# Only the named template variables (traefik_yml_b64, router_js_b64,
+# router_pkg_b64, router_port, mongodb_uri, platform_domain) are
+# substituted at apply time. All other shell vars use $NAME (no curlies)
+# so Terraform leaves them alone.
+set -euxo pipefail
+exec > >(tee /var/log/proxy-bootstrap.log) 2>&1
+
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -y
+apt-get install -y -qq ca-certificates curl gnupg
+
+# ── Docker (official apt repo) ────────────────────────────────────────
+install -m 0755 -d /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | \
+  gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+chmod a+r /etc/apt/keyrings/docker.gpg
+
+. /etc/os-release
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
+https://download.docker.com/linux/ubuntu $VERSION_CODENAME stable" \
+  > /etc/apt/sources.list.d/docker.list
+
+apt-get update -y
+apt-get install -y -qq \
+  docker-ce docker-ce-cli containerd.io docker-buildx-plugin
+
+systemctl enable --now docker
+
+# ── Node 20 (for the traefik-router) ─────────────────────────────────
+if ! command -v node >/dev/null \
+  || [ "$(node -v | sed -E 's/^v([0-9]+)\..*/\1/')" -lt 20 ]; then
+  curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+  apt-get install -y nodejs
+fi
+
+# ── traefik-router ────────────────────────────────────────────────────
+mkdir -p /opt/traefik-router/bootstrap
+echo "${router_js_b64gz}" | base64 -d | gunzip > /opt/traefik-router/server.js
+echo "${router_pkg_b64}"  | base64 -d         > /opt/traefik-router/package.json
+# Workspace bootstrap script — the router serves this at
+# GET /bootstrap/cloud-init.sh so workspace EC2s can curl it down at boot
+# without embedding all 23KB in their own user-data (would blow past the
+# 16KB AWS user-data cap). Gzipped before base64 so the proxy user-data
+# itself also stays under AWS's limits.
+echo "${cloud_init_b64gz}" | base64 -d | gunzip > /opt/traefik-router/bootstrap/cloud-init.sh
+chmod 644 /opt/traefik-router/bootstrap/cloud-init.sh
+( cd /opt/traefik-router && npm install --omit=dev --no-fund --no-audit )
+
+# Mongo URI lives in a 0600 env file — never world-readable.
+cat > /etc/traefik-router.env <<ENVEOF
+PORT=${router_port}
+PLATFORM_DOMAIN=${platform_domain}
+PLATFORM_PROTOCOL=${platform_protocol}
+MONGODB_URI=${mongodb_uri}
+ENVEOF
+chmod 600 /etc/traefik-router.env
+
+cat > /etc/systemd/system/traefik-router.service <<'UNITEOF'
+[Unit]
+Description=Traefik HTTP-provider router (Mongo-backed)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+EnvironmentFile=/etc/traefik-router.env
+WorkingDirectory=/opt/traefik-router
+ExecStart=/usr/bin/node /opt/traefik-router/server.js
+Restart=always
+RestartSec=2
+User=root
+
+[Install]
+WantedBy=multi-user.target
+UNITEOF
+
+systemctl daemon-reload
+systemctl enable --now traefik-router.service
+
+# ── Traefik ───────────────────────────────────────────────────────────
+mkdir -p /etc/traefik
+echo "${traefik_yml_b64}" | base64 -d > /etc/traefik/traefik.yml
+chmod 644 /etc/traefik/traefik.yml
+
+cat > /etc/systemd/system/traefik.service <<UNITEOF
+[Unit]
+Description=Traefik edge proxy
+Requires=docker.service traefik-router.service
+After=docker.service traefik-router.service network-online.target
+Wants=network-online.target
+
+[Service]
+Restart=always
+RestartSec=3
+# --network host so Traefik can reach the router on 127.0.0.1:${router_port}
+# without per-service Docker networking. The container still binds :80 on
+# the host because of the same --network host setting.
+ExecStartPre=-/usr/bin/docker rm -f traefik
+ExecStart=/usr/bin/docker run --rm --name traefik \
+  --network host \
+  -v /etc/traefik/traefik.yml:/etc/traefik/traefik.yml:ro \
+  traefik:v3.2
+ExecStop=/usr/bin/docker stop traefik
+
+[Install]
+WantedBy=multi-user.target
+UNITEOF
+
+systemctl daemon-reload
+systemctl enable --now traefik.service

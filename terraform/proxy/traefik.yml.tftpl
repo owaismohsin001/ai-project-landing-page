@@ -1,0 +1,37 @@
+# Static Traefik configuration for the central edge proxy.
+# Rendered by Terraform — only ${backend_config_url} and
+# ${config_poll_seconds} are substituted at apply time.
+#
+# Dynamic routing rules (per-user HostRegexp → user EC2) are pulled from
+# the landing-page backend via the HTTP provider. The backend must return
+# a Traefik v3 dynamic-config JSON document at backend_config_url.
+
+global:
+  checkNewVersion: false
+  sendAnonymousUsage: false
+
+log:
+  level: INFO
+
+accessLog: {}
+
+entryPoints:
+  web:
+    address: ":80"
+  ping:
+    address: ":8081"
+
+ping:
+  entryPoint: ping
+
+# HTTP provider: Traefik re-fetches dynamic config from the URL below
+# every ${config_poll_seconds}s and applies any diff with zero downtime.
+providers:
+  http:
+    endpoint: "${backend_config_url}"
+    pollInterval: "${config_poll_seconds}s"
+    pollTimeout: "5s"
+
+api:
+  dashboard: false
+  insecure: false

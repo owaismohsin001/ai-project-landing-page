@@ -1,0 +1,13 @@
+{
+  "name": "traefik-router",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Serves Traefik v3 HTTP-provider dynamic config to both the central edge proxy and every per-user workspace. Queries the same MongoDB the landing-page app uses.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "mongodb": "6.10.0"
+  }
+}

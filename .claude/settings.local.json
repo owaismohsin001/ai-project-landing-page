@@ -1,0 +1,35 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(node -e \"console.log\\(require\\('crypto'\\).randomBytes\\(48\\).toString\\('hex'\\)\\)\")",
+      "Bash(npm install *)",
+      "Bash(npm run *)",
+      "Bash(curl -s http://localhost:3000/)",
+      "Bash(grep -o -E '\\(Build smarter with|Starter|Pro|Premium|Enterprise|Most popular|\\\\$20|\\\\$60|\\\\$200\\)')",
+      "Bash(curl -s -X POST http://localhost:3000/api/checkout -H \"Content-Type: application/json\" -d '{\"plan\":\"bogus\"}')",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" http://localhost:3000/api/auth/me)",
+      "Bash(grep -o -E '\\\\$<!-- -->[0-9]+')",
+      "Bash(powershell -Command \"Get-Process node -ErrorAction SilentlyContinue | Stop-Process -Force\")",
+      "Bash(stripe --version)",
+      "Bash(echo \"exit:$?\")",
+      "Bash(where.exe stripe *)",
+      "Bash(where.exe scoop *)",
+      "Bash(where.exe choco *)",
+      "Bash(powershell -Command \"Get-Process node,stripe -ErrorAction SilentlyContinue | Stop-Process -Force\")",
+      "Bash(node scripts/create-webhook.mjs)",
+      "Bash(node scripts/create-webhook.mjs http://localhost:3000)",
+      "Bash(npx tsc *)",
+      "Bash(echo \"typecheck exit:$?\")",
+      "Bash(aws configure *)",
+      "Bash(aws sts *)",
+      "Bash(terraform fmt *)",
+      "Bash(echo \"fmt:$?\")",
+      "Bash(terraform init *)",
+      "Bash(echo \"init exit:$?\")",
+      "Bash(terraform validate *)",
+      "Bash(echo \"validate exit:$?\")",
+      "Bash(powershell -Command \"Get-Process terraform -ErrorAction SilentlyContinue | Select-Object Id,StartTime\")",
+      "Bash(node size-check.mjs)"
+    ]
+  }
+}

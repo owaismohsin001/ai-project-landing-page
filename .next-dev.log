@@ -1,0 +1,29 @@
+
+> ai-landing-page@0.1.0 dev
+> next dev
+
+   ▲ Next.js 15.5.18
+   - Local:        http://localhost:3000
+   - Network:      http://192.168.56.1:3000
+   - Environments: .env.local
+
+ ✓ Starting...
+ ✓ Ready in 2.9s
+ ○ Compiling / ...
+ ✓ Compiled / in 5s (610 modules)
+ GET / 200 in 5704ms
+ ○ Compiling /api/contact ...
+ ✓ Compiled /api/contact in 1486ms (634 modules)
+
+──────────────── EMAIL ────────────────
+To:      sales@example.com
+Subject: [AI] New Enterprise enquiry from DNS Smoke
+
+Name: DNS Smoke
+Email: dns-smoke@example.com
+Company: Test
+
+Smoke test for Mongo path after URI fix
+────────────────────────────────────────
+
+ POST /api/contact 200 in 5792ms

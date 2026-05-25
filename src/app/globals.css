@@ -1,0 +1,28 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+body {
+  @apply bg-ink-900 text-slate-200 antialiased;
+}
+
+/* Subtle blue radial glow used behind hero / auth sections. */
+.glow {
+  position: relative;
+}
+.glow::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  background: radial-gradient(
+    700px circle at 50% -10%,
+    rgba(37, 99, 235, 0.22),
+    transparent 70%
+  );
+  pointer-events: none;
+}
