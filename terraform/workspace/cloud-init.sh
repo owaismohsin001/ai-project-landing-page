@@ -512,6 +512,14 @@ services:
     container_name: ${PLAYWRIGHT_CONTAINER}
     restart: unless-stopped
     shm_size: 2gb
+    # Pass GEMINI_API_KEY through to the container for the
+    # install-hyperframes skill's AI asset generation. Read from the
+    # shell env at compose-up time; empty string if not set on host.
+    # Operators set the actual value in /etc/workspace.env (which the
+    # Terraform wrapper user-data writes) — that file is sourced into
+    # the shell where this compose command runs, so the var lands here.
+    environment:
+      - GEMINI_API_KEY=\${GEMINI_API_KEY:-}
     volumes:
       - ${PROJECT_DIR}:/work
     working_dir: /work
