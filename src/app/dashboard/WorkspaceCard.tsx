@@ -220,15 +220,31 @@ export function WorkspaceCard({ initial }: Props) {
         </p>
       )}
 
-      {/* Status-specific helper text. */}
+      {/* Status-specific helper text. The message switches at 95% — by that
+          point the AWS resources are all created and we're just waiting on
+          the EC2 instance's cloud-init to finish (apt installs, npm install,
+          Docker pull, services start). That phase is the longest and the
+          earlier "creating resources" copy starts feeling misleading. */}
       {state.status === "provisioning" && (
         <div className="mt-4 space-y-3">
           <div className="flex items-start gap-4">
             <Gears />
             <p className="flex-1 text-sm text-slate-600 dark:text-slate-300">
-              Spinning up your dedicated EC2 instance, S3 bucket, and IAM
-              user. This usually takes 3–5 minutes — leave this page open and
-              it&apos;ll update on its own.
+              {progress < 95 ? (
+                <>
+                  Spinning up your dedicated EC2 instance, S3 bucket, and IAM
+                  user. This usually takes 5–10 minutes — leave this page open
+                  and it&apos;ll update on its own.
+                </>
+              ) : (
+                <>
+                  AWS resources are created. Now waiting for the instance to
+                  finish booting and the workspace services to come online
+                  (apt + Node + Docker setup). This is the longest part —
+                  hang tight, the bar will jump to 100% as soon as your
+                  workspace URL becomes reachable.
+                </>
+              )}
             </p>
           </div>
           <ProgressBar value={progress} />

@@ -270,7 +270,9 @@ cat > "${CODE_USER_DIR}/settings.json" <<'EOF'
   "workbench.welcomePage.walkthroughs.openOnInstall": false,
   "update.showReleaseNotes": false,
   "extensions.autoCheckUpdates": false,
-  "security.workspace.trust.enabled": false
+  "security.workspace.trust.enabled": false,
+  "window.restoreWindows": "none",
+  "workbench.welcomePage.experimental.startEntries.enabled": false
 }
 EOF
 chown -R "${TARGET_USER}:${TARGET_USER}" "${TARGET_HOME}/.local/share/code-server"

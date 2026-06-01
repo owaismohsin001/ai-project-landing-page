@@ -166,6 +166,89 @@ async function expectTerraform(
 }
 
 /**
+ * After terraform finishes, the EC2 instance is "created" but cloud-init is
+ * still installing apt packages, Node, Docker, the Playwright container, etc.
+ * for several more minutes. During that window the public URL returns 502
+ * or 504 from Traefik because the upstream (Next.js / code-server) isn't
+ * bound yet.
+ *
+ * If we flip status to "ready" the instant terraform exits, users click
+ * "Open workspace" and land on a Bad Gateway page. So we poll the URL
+ * until it actually responds with a non-5xx, then return.
+ *
+ * Anything < 500 counts as "alive" — including 3xx redirects and 404s.
+ * Only 5xx (typically 502 / 503 / 504 from Traefik) means the upstream is
+ * still down.
+ *
+ * Progress reporting maps the wait into the 95-99% range so the UI bar
+ * keeps creeping forward while we wait, instead of looking frozen at 95%.
+ *
+ * Caps at MAX_WAIT_MS — if cloud-init genuinely fails we don't want to
+ * pin the request open forever. After the cap we log a warning and let
+ * the caller proceed; the user will see a brief 502 and can refresh.
+ */
+async function waitForWorkspaceReady(
+  url: string,
+  onProgress?: (pct: number) => void | Promise<void>
+): Promise<void> {
+  const INTERVAL_MS = 5_000;
+  const MAX_WAIT_MS = 15 * 60_000; // 15 minutes worst-case (slow apt + npm)
+  const REQUEST_TIMEOUT_MS = 10_000;
+  const RANGE_START = 95;
+  const RANGE_END = 99;
+
+  const startedAt = Date.now();
+  let attempt = 0;
+
+  while (Date.now() - startedAt < MAX_WAIT_MS) {
+    attempt += 1;
+    let alive = false;
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+    try {
+      const res = await fetch(url, {
+        method: "GET",
+        signal: controller.signal,
+        // Don't auto-follow — we only need to know the upstream answered.
+        // A 307/302 from Next.js root still proves the server is up.
+        redirect: "manual",
+        // Don't let any HTTP cache (Cloudflare, browser, etc.) serve us
+        // a stale 502 — every poll must hit origin.
+        cache: "no-store",
+      });
+      if (res.status < 500) alive = true;
+    } catch {
+      // Network error, DNS, abort — treat as "not ready yet" and keep polling.
+    } finally {
+      clearTimeout(timer);
+    }
+
+    if (alive) {
+      if (onProgress) await onProgress(RANGE_END);
+      console.log(
+        `[workspace] waitForWorkspaceReady: ${url} responded on attempt ${attempt}`
+      );
+      return;
+    }
+
+    // Ramp progress slowly through the wait window.
+    if (onProgress) {
+      const elapsed = Date.now() - startedAt;
+      const frac = Math.min(1, elapsed / MAX_WAIT_MS);
+      const pct = RANGE_START + frac * (RANGE_END - RANGE_START);
+      await onProgress(pct);
+    }
+
+    await new Promise((r) => setTimeout(r, INTERVAL_MS));
+  }
+
+  console.warn(
+    `[workspace] waitForWorkspaceReady: gave up after ${MAX_WAIT_MS / 1000}s on ${url} — user may see a brief 502`
+  );
+}
+
+/**
  * Apex domain Traefik routes per-user services under. Service URLs are
  * built as `<service>.<userId>.<PLATFORM_DOMAIN>` and resolve through the
  * Cloudflare wildcard → ALB → central Traefik → per-user Traefik path.
@@ -216,10 +299,15 @@ export async function provisionWorkspace(
   // Wrap the optional callback so the rest of this function can call it
   // unconditionally + swallow any error from a slow DB write (we never
   // want a progress-tracking failure to abort actual provisioning).
+  //
+  // Capped at 99 — the final flip to 100 happens in provisionUserWorkspace
+  // when it writes status="ready" to the DB. That separation guarantees
+  // the bar never reads "100% complete" before the workspace document is
+  // actually persisted with the EC2 / S3 / IAM details the dashboard reads.
   const reportProgress = async (pct: number) => {
     if (!onProgress) return;
     try {
-      await onProgress(Math.min(95, Math.max(0, Math.round(pct))));
+      await onProgress(Math.min(99, Math.max(0, Math.round(pct))));
     } catch {
       /* ignore */
     }
@@ -306,6 +394,16 @@ export async function provisionWorkspace(
   const outputs = JSON.parse(out.stdout) as Record<string, { value: string }>;
 
   await reportProgress(95);
+
+  // Terraform has exited but the EC2 is still mid-cloud-init: apt installs,
+  // node_modules, docker pull, etc. — typically another 5–10 minutes. Poll
+  // the public URL until it actually responds so users don't click "Open
+  // workspace" and land on a 502 Bad Gateway from Traefik.
+  await waitForWorkspaceReady(outputs.workspace_url.value, async (pct) => {
+    // Forward via the outer onProgress wrapper so the 95-cap + min/max
+    // clamping in reportProgress() still applies.
+    await reportProgress(pct);
+  });
 
   return {
     instanceId: outputs.instance_id.value,
