@@ -58,16 +58,27 @@ let mongoReady = client
 
 // Default services every workspace gets, even if no WorkspaceService docs
 // exist. Subdomains land on these via per-user Traefik.
+//
+// docs/sheets host pre-installed ONLYOFFICE Docs Server instances (DOCX
+// editor on :4000, XLSX on :4001). docs-agent/sheets-agent are the
+// Playwright-driven headless co-editor sidecars that hold each service's
+// AI-attributed editing session and bridge MCP tool calls into the
+// Asc.plugin.callCommand API over WebSocket.
 const DEFAULT_SERVICES = [
   { name: "frontend", port: 3000 },
   { name: "api", port: 8090 },
   { name: "ide", port: 8080 },
+  { name: "docs", port: 4000 },
+  { name: "sheets", port: 4001 },
+  { name: "docs-agent", port: 4100 },
+  { name: "sheets-agent", port: 4101 },
 ];
 
 // Ports owned by the workspace runtime itself — never register these as
 // user services. 80 = per-user Traefik, 8081 = Traefik ping, 9099 =
-// workspace HTTP server (backup/restore).
-const RESERVED_PORTS = new Set([80, 8081, 9099]);
+// workspace HTTP server (backup/restore), 4000/4001 = ONLYOFFICE Docs
+// Server (docs/sheets), 4100/4101 = the docs-agent/sheets-agent sidecars.
+const RESERVED_PORTS = new Set([80, 8081, 9099, 4000, 4001, 4100, 4101]);
 
 function defaultServiceForPort(port) {
   return DEFAULT_SERVICES.find((s) => s.port === port) ?? null;
@@ -178,12 +189,27 @@ async function buildUserConfig(userId) {
 
   const routers = {};
   const services = {};
+
+  // Services whose responses must be iframe-embeddable from any origin.
+  // ONLYOFFICE Docs Server sends `X-Frame-Options: SAMEORIGIN` by default,
+  // which blocks the frontend (frontend-<userId>...) from iframing the
+  // editor — and the design here is that the user opens documents inside
+  // the workspace shell, not by navigating to docs-<userId>... directly.
+  // Stripping the header at Traefik is portable across ONLYOFFICE versions
+  // (env vars for this are inconsistent) and targets only these two
+  // services without broadly relaxing headers for the whole workspace.
+  const IFRAME_ANYORIGIN_SERVICES = new Set(["docs", "sheets"]);
+
   for (const svc of all) {
-    routers[svc.name] = {
+    const router = {
       rule: `Host(\`${svc.name}-${userId}.${PLATFORM_DOMAIN}\`)`,
       service: svc.name,
       entryPoints: ["web"],
     };
+    if (IFRAME_ANYORIGIN_SERVICES.has(svc.name)) {
+      router.middlewares = ["office-iframe-anyorigin"];
+    }
+    routers[svc.name] = router;
     services[svc.name] = {
       loadBalancer: {
         servers: [{ url: `http://127.0.0.1:${svc.port}` }],
@@ -191,7 +217,23 @@ async function buildUserConfig(userId) {
     };
   }
 
-  return { http: { routers, services } };
+  // Empty-string value in customResponseHeaders removes the header
+  // upstream emitted. Leaving Content-Security-Policy untouched so any
+  // legitimate CSP from ONLYOFFICE (e.g. anti-XSS for document content)
+  // still applies — modern ONLYOFFICE doesn't restrict frame-ancestors
+  // via CSP by default. If we ever see iframe blocking from CSP after
+  // X-Frame-Options is gone, add `"Content-Security-Policy": ""` here.
+  const middlewares = {
+    "office-iframe-anyorigin": {
+      headers: {
+        customResponseHeaders: {
+          "X-Frame-Options": "",
+        },
+      },
+    },
+  };
+
+  return { http: { routers, services, middlewares } };
 }
 
 async function readJsonBody(req) {

@@ -6,8 +6,9 @@ import mongoose, { Schema, model, models } from "mongoose";
  * one Traefik router/service per doc, so the per-user Traefik picks up
  * `<name>.<userId>.<PLATFORM_DOMAIN>` → `127.0.0.1:<port>` automatically.
  *
- * The three default services (frontend / api / ide) are NOT stored here —
- * they're hard-coded in the router. Users only create rows for extras.
+ * The default services (frontend / api / ide / docs / sheets / docs-agent
+ * / sheets-agent) are NOT stored here — they're hard-coded in the router.
+ * Users only create rows for extras.
  */
 export interface IWorkspaceService {
   _id: mongoose.Types.ObjectId;
@@ -19,7 +20,18 @@ export interface IWorkspaceService {
   createdAt: Date;
 }
 
-const RESERVED_NAMES = new Set(["frontend", "api", "ide"]);
+const RESERVED_NAMES = new Set([
+  "frontend",
+  "api",
+  "ide",
+  // Pre-installed office editors (ONLYOFFICE Docs Server) + their
+  // Playwright-driven agent sidecars. Defined as DEFAULT_SERVICES in the
+  // proxy router; users cannot shadow them.
+  "docs",
+  "sheets",
+  "docs-agent",
+  "sheets-agent",
+]);
 
 const workspaceServiceSchema = new Schema<IWorkspaceService>(
   {
@@ -33,7 +45,7 @@ const workspaceServiceSchema = new Schema<IWorkspaceService>(
         validator: (v: string) =>
           /^[a-z0-9-]{1,32}$/.test(v) && !RESERVED_NAMES.has(v),
         message:
-          "name must be 1-32 chars of [a-z0-9-] and not one of the reserved subdomains (frontend, api, ide).",
+          "name must be 1-32 chars of [a-z0-9-] and not one of the reserved subdomains (frontend, api, ide, docs, sheets, docs-agent, sheets-agent).",
       },
     },
     port: {
@@ -42,9 +54,19 @@ const workspaceServiceSchema = new Schema<IWorkspaceService>(
       min: 1,
       max: 65535,
       validate: {
-        // Block ports already owned by Traefik / the workspace HTTP server.
-        validator: (v: number) => v !== 80 && v !== 8081 && v !== 9099,
-        message: "port 80, 8081, and 9099 are reserved.",
+        // Block ports already owned by Traefik / the workspace HTTP
+        // server / pre-installed office services. Keep in sync with
+        // RESERVED_PORTS in terraform/proxy/router/server.js.
+        validator: (v: number) =>
+          v !== 80 &&
+          v !== 8081 &&
+          v !== 9099 &&
+          v !== 4000 &&
+          v !== 4001 &&
+          v !== 4100 &&
+          v !== 4101,
+        message:
+          "port 80, 8081, 9099, 4000, 4001, 4100, and 4101 are reserved.",
       },
     },
   },

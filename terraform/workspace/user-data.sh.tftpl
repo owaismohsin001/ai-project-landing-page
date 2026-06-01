@@ -41,6 +41,14 @@ PUBLIC_IP=$(imds public-ipv4)
 INSTANCE_IP=$(imds public-ipv4)
 PUBLIC_HOSTNAME=$(imds public-hostname)
 
+# JWT secret shared by every process that talks to ONLYOFFICE Docs Server:
+# the docs/sheets containers themselves (JWT validation), the backend's
+# editor-config + callback endpoints, and the docs-agent/sheets-agent
+# sidecars that construct editor URLs for their headless browser sessions.
+# Generated once per instance — user-data is run-once by cloud-init, so
+# this value is stable across reboots (it survives in /etc/workspace.env).
+OFFICE_JWT_SECRET=$(openssl rand -hex 32)
+
 # Shared env consumed by workspace.service AND the AI-IDE backend/frontend
 # (their systemd units have EnvironmentFile=/etc/workspace.env), and also
 # sourced by cloud-init.sh so it doesn't need to re-query IMDS.
@@ -63,6 +71,7 @@ PLATFORM_DOMAIN=${platform_domain}
 PLATFORM_PROTOCOL=${platform_protocol}
 PUBLIC_HOST=${user_id}.${platform_domain}
 PROXY_ROUTER_URL=${proxy_router_url}
+OFFICE_JWT_SECRET=$OFFICE_JWT_SECRET
 ENVEOF
 chmod 600 /etc/workspace.env
 
@@ -89,6 +98,7 @@ export PLATFORM_DOMAIN=${platform_domain}
 export PLATFORM_PROTOCOL=${platform_protocol}
 export PUBLIC_HOST=${user_id}.${platform_domain}
 export PROXY_ROUTER_URL=${proxy_router_url}
+export OFFICE_JWT_SECRET=$OFFICE_JWT_SECRET
 ENVEOF
 chmod 644 /etc/profile.d/workspace.sh
 

@@ -644,6 +644,222 @@ fi
 done_step "Step 8 / 9 — Playwright Docker container"
 
 # ────────────────────────────────────────────────────────────────────
+# Step 8.5 — ONLYOFFICE Docs Server (docs:4000 + sheets:4001)
+# ────────────────────────────────────────────────────────────────────
+#
+# Two ONLYOFFICE Docs Server containers, one per service identity:
+#   - ai-ide-onlyoffice-docs   on 127.0.0.1:4000  (DOCX editor)
+#   - ai-ide-onlyoffice-sheets on 127.0.0.1:4001  (XLSX editor)
+#
+# Both share OFFICE_JWT_SECRET (set in /etc/workspace.env by user-data)
+# so the same backend can sign editor configs / callback tokens for either
+# container. Each gets its own data volumes — sessions and document keys
+# survive container restarts but stay isolated per-editor.
+#
+# Public access is only via the per-user Traefik on :80 routing the
+# subdomains docs-$USER_ID.$DOMAIN / sheets-$USER_ID.$DOMAIN to these
+# ports (proxy router's DEFAULT_SERVICES). Direct external access is
+# blocked because the containers bind 127.0.0.1.
+
+hdr "Step 8.5 — ONLYOFFICE Docs Server (docs + sheets)"
+
+readonly ONLYOFFICE_DIR=/opt/onlyoffice
+readonly ONLYOFFICE_IMAGE="onlyoffice/documentserver:8.3"
+
+# Re-source /etc/workspace.env to make sure OFFICE_JWT_SECRET is in scope
+# (user-data already exported it for the parent shell; we're in a sub-
+# shell here, so source defensively).
+if [ -f /etc/workspace.env ]; then
+  set -a
+  # shellcheck disable=SC1091
+  . /etc/workspace.env
+  set +a
+fi
+
+if [ -z "${OFFICE_JWT_SECRET:-}" ]; then
+  err "OFFICE_JWT_SECRET is missing from /etc/workspace.env — refusing to start ONLYOFFICE"
+  exit 1
+fi
+
+log "Creating data volumes under ${ONLYOFFICE_DIR}"
+mkdir -p \
+  "${ONLYOFFICE_DIR}/docs/logs"   "${ONLYOFFICE_DIR}/docs/data"   \
+  "${ONLYOFFICE_DIR}/docs/lib"    "${ONLYOFFICE_DIR}/docs/db"     \
+  "${ONLYOFFICE_DIR}/sheets/logs" "${ONLYOFFICE_DIR}/sheets/data" \
+  "${ONLYOFFICE_DIR}/sheets/lib"  "${ONLYOFFICE_DIR}/sheets/db"
+
+log "Writing ${ONLYOFFICE_DIR}/docker-compose.yml"
+# Two ONLYOFFICE containers. JWT_ENABLED=true forces every editor-config
+# and callback payload to be signed — the backend that mounts editors
+# must use OFFICE_JWT_SECRET to sign or validation fails. Each container
+# binds 127.0.0.1 only so the only ingress is via per-user Traefik.
+cat > "${ONLYOFFICE_DIR}/docker-compose.yml" <<EOF
+services:
+  docs:
+    image: ${ONLYOFFICE_IMAGE}
+    container_name: ai-ide-onlyoffice-docs
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:4000:80"
+    environment:
+      - JWT_ENABLED=true
+      - JWT_SECRET=\${OFFICE_JWT_SECRET}
+      - WOPI_ENABLED=false
+    volumes:
+      - ${ONLYOFFICE_DIR}/docs/logs:/var/log/onlyoffice
+      - ${ONLYOFFICE_DIR}/docs/data:/var/www/onlyoffice/Data
+      - ${ONLYOFFICE_DIR}/docs/lib:/var/lib/onlyoffice
+      - ${ONLYOFFICE_DIR}/docs/db:/var/lib/postgresql
+
+  sheets:
+    image: ${ONLYOFFICE_IMAGE}
+    container_name: ai-ide-onlyoffice-sheets
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:4001:80"
+    environment:
+      - JWT_ENABLED=true
+      - JWT_SECRET=\${OFFICE_JWT_SECRET}
+      - WOPI_ENABLED=false
+    volumes:
+      - ${ONLYOFFICE_DIR}/sheets/logs:/var/log/onlyoffice
+      - ${ONLYOFFICE_DIR}/sheets/data:/var/www/onlyoffice/Data
+      - ${ONLYOFFICE_DIR}/sheets/lib:/var/lib/onlyoffice
+      - ${ONLYOFFICE_DIR}/sheets/db:/var/lib/postgresql
+EOF
+
+# Also drop a .env file alongside the compose file so an operator running
+# `docker compose up -d` by hand picks up the secret without sourcing
+# /etc/workspace.env. Compose reads it automatically.
+cat > "${ONLYOFFICE_DIR}/.env" <<EOF
+OFFICE_JWT_SECRET=${OFFICE_JWT_SECRET}
+EOF
+chmod 600 "${ONLYOFFICE_DIR}/.env"
+
+log "Pulling ${ONLYOFFICE_IMAGE} (~700MB — first time only)"
+docker pull "$ONLYOFFICE_IMAGE" 2>&1 | indent
+ok "Image pulled"
+
+# Systemd unit so the compose stack survives reboots without depending on
+# the workspace.service or the AI-IDE backend. ExecStart= uses docker
+# compose v2 (already installed alongside docker-ce in Step 8).
+log "Installing /etc/systemd/system/ai-ide-onlyoffice.service"
+cat > /etc/systemd/system/ai-ide-onlyoffice.service <<EOF
+[Unit]
+Description=ONLYOFFICE Docs Server (docs:4000 + sheets:4001)
+Requires=docker.service
+After=docker.service traefik.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+EnvironmentFile=/etc/workspace.env
+WorkingDirectory=${ONLYOFFICE_DIR}
+ExecStart=/usr/bin/docker compose up -d
+ExecStop=/usr/bin/docker compose down
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now ai-ide-onlyoffice.service 2>&1 | indent
+
+# Quick sanity check — both containers should be up
+sleep 3
+for c in ai-ide-onlyoffice-docs ai-ide-onlyoffice-sheets; do
+  if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$c"; then
+    ok "  ${c}: running"
+  else
+    warn "  ${c}: not running yet (cold start can take ~30s — check 'docker logs ${c}')"
+  fi
+done
+
+done_step "Step 8.5 — ONLYOFFICE Docs Server"
+
+# ────────────────────────────────────────────────────────────────────
+# Step 8.6 — docs-agent + sheets-agent sidecars
+# ────────────────────────────────────────────────────────────────────
+#
+# Two long-running Node processes, one per editor service:
+#
+#   ai-ide-docs-agent.service    AGENT_KIND=docs    PORT=4100
+#   ai-ide-sheets-agent.service  AGENT_KIND=sheets  PORT=4101
+#
+# Both run the same source file (src/agent.ts under the cloned
+# AIWorkspaceBackEnd repo) via tsx — no separate install, no separate
+# repo, no extra npm install. The agent process owns:
+#
+#   - WS  /plugin   the ai-agent-bridge plugin (running inside the
+#                   user's ONLYOFFICE editor iframe) connects here on
+#                   load and stays open
+#   - POST /cmd     backend MCP tools (docs_* / sheets_*) call this
+#                   with { op, args } to forward commands into the
+#                   editor's Asc.plugin.callCommand sandbox
+#   - GET  /health  liveness + connected-editor count
+#
+# Traefik's per-user config (from DEFAULT_SERVICES on the proxy router,
+# updated in Phase 1) already routes docs-agent-$USER_ID.$DOMAIN to
+# 127.0.0.1:4100 and sheets-agent-$USER_ID.$DOMAIN to 127.0.0.1:4101.
+
+hdr "Step 8.6 — docs-agent + sheets-agent sidecars"
+
+make_agent_unit() {
+  local svc="$1" kind="$2" port="$3"
+  cat > "/etc/systemd/system/${svc}.service" <<UNITEOF
+[Unit]
+Description=AI-IDE ${kind}-agent (port ${port}) — WS bridge to ONLYOFFICE plugin
+After=network.target ai-ide-backend.service ai-ide-onlyoffice.service
+Wants=ai-ide-onlyoffice.service
+
+[Service]
+Type=simple
+User=${TARGET_USER}
+WorkingDirectory=${PROJECT_DIR}/backend
+EnvironmentFile=/etc/workspace.env
+Environment=NODE_ENV=production
+Environment=AGENT_KIND=${kind}
+Environment=HOST=0.0.0.0
+Environment=PORT=${port}
+# tsx is already installed by the backend's npm install (Step 6) — invoke
+# via the local node_modules .bin so we don't need a global install.
+ExecStart=${PROJECT_DIR}/backend/node_modules/.bin/tsx src/agent.ts
+Restart=always
+RestartSec=5
+StartLimitIntervalSec=0
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+UNITEOF
+}
+
+log "Writing systemd units for docs-agent (:4100) and sheets-agent (:4101)"
+make_agent_unit ai-ide-docs-agent   docs   4100
+make_agent_unit ai-ide-sheets-agent sheets 4101
+
+systemctl daemon-reload
+systemctl enable --now ai-ide-docs-agent.service   2>&1 | indent
+systemctl enable --now ai-ide-sheets-agent.service 2>&1 | indent
+
+# Brief sanity check
+sleep 2
+for svc in ai-ide-docs-agent ai-ide-sheets-agent; do
+  state=$(systemctl is-active "$svc" || true)
+  if [ "$state" = "active" ]; then
+    ok "  ${svc}: ${state}"
+  else
+    warn "  ${svc}: ${state} (check 'journalctl -u ${svc} -e' for details)"
+  fi
+done
+
+done_step "Step 8.6 — docs-agent + sheets-agent sidecars"
+
+# ────────────────────────────────────────────────────────────────────
 # Step 9 / 9 — Service boot-restoration (tmux recipes survive reboots)
 # ────────────────────────────────────────────────────────────────────
 #
@@ -767,6 +983,24 @@ browser (it's on a different origin).
 - Frontend (Next.js, port 3000):  ${PROXY_SCHEME}://frontend-${PROXY_USER}.${PROXY_DOMAIN}
 - Backend API (Hono, port 8090):  ${PROXY_SCHEME}://api-${PROXY_USER}.${PROXY_DOMAIN}
 - code-server / IDE (port 8080):  ${PROXY_SCHEME}://ide-${PROXY_USER}.${PROXY_DOMAIN}
+
+## Pre-installed office editors
+
+ONLYOFFICE Docs Server is installed by default on every workspace:
+
+- **docs**   (DOCX, port 4000): ${PROXY_SCHEME}://docs-${PROXY_USER}.${PROXY_DOMAIN}
+- **sheets** (XLSX, port 4001): ${PROXY_SCHEME}://sheets-${PROXY_USER}.${PROXY_DOMAIN}
+
+Don't send the user to those raw URLs — they serve ONLYOFFICE's own
+welcome page, not the user's document. To open a real document, use the
+backend's \`/api/office/config\` endpoint to get a signed editor config,
+then mount \`new DocsAPI.DocEditor(...)\` inside the frontend. The
+companion Playwright-driven sidecars \`docs-agent\` and \`sheets-agent\`
+host headless co-editor sessions and bridge MCP tool calls into the
+editor's JS API.
+
+When the user asks to edit a document or spreadsheet, prefer the
+\`docs_*\` / \`sheets_*\` MCP tools (when available) over UI automation.
 
 ## Adding a new service
 
