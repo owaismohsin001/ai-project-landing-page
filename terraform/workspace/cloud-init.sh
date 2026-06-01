@@ -361,8 +361,14 @@ Environment=NODE_ENV=production
 Environment=HOST=0.0.0.0
 Environment=PORT=${BACKEND_PORT}
 ExecStart=/usr/bin/npm run dev
-Restart=on-failure
+# Restart=always catches BOTH crashes and clean exits (signal, OOM-with-exit-0).
+# StartLimitIntervalSec=0 disables the rate-limit that would otherwise stop
+# restarts after a few rapid failures. The "hung but alive" case (process up
+# but port not answering → user sees 502) is caught separately by
+# ai-ide-backend-healthcheck.timer further down.
+Restart=always
 RestartSec=5
+StartLimitIntervalSec=0
 StandardOutput=journal
 StandardError=journal
 
@@ -401,8 +407,13 @@ Environment=NEXT_PUBLIC_CODE_SERVER_URL=${PLATFORM_PROTOCOL:-http}://ide-${USER_
 Environment=NEXT_PUBLIC_USER_ID=${USER_ID}
 Environment=NEXT_PUBLIC_PLATFORM_DOMAIN=${PLATFORM_DOMAIN}
 ExecStart=${PROJECT_DIR}/frontend/node_modules/.bin/next dev -p ${FRONTEND_PORT} -H 0.0.0.0
-Restart=on-failure
+# See ai-ide-backend.service for rationale on Restart=always +
+# StartLimitIntervalSec=0. Hung dev-server detection (Next.js sometimes wedges
+# with the HMR socket alive but HTTP no longer answering) is handled by
+# ai-ide-frontend-healthcheck.timer.
+Restart=always
 RestartSec=5
+StartLimitIntervalSec=0
 StandardOutput=journal
 StandardError=journal
 
@@ -436,6 +447,82 @@ systemctl enable --now ai-ide-backend
 
 log "Enabling ai-ide-frontend"
 systemctl enable --now ai-ide-frontend
+
+# --- Healthcheck (watchdog) for backend + frontend ---
+# Restart=always covers crashes and clean exits, but a Next/Hono dev server
+# can also wedge: process stays alive, port stops answering. systemd sees
+# "active" and does nothing → Traefik proxies the request, gets nothing
+# back, and returns 502 to the user. This timer polls each service's local
+# port every 30s and force-restarts the unit if 3 consecutive checks fail.
+log "Installing healthcheck script + timers for backend + frontend"
+
+cat > /usr/local/bin/ai-ide-healthcheck.sh <<'HEALTH_EOF'
+#!/usr/bin/env bash
+# ai-ide-healthcheck.sh — restart a service when its HTTP port stops answering.
+# Usage: ai-ide-healthcheck.sh <service-suffix> <port>
+#   e.g. ai-ide-healthcheck.sh frontend 3000
+set -uo pipefail
+readonly SVC_SUFFIX="${1:?need service suffix}"
+readonly PORT="${2:?need port}"
+readonly SVC="ai-ide-${SVC_SUFFIX}"
+
+# Don't intervene if systemd already considers the unit down — its own
+# Restart= directive is in charge there, and stacking restarts would just
+# fight it.
+state=$(systemctl is-active "$SVC" 2>/dev/null || true)
+if [ "$state" != "active" ]; then
+  echo "[ai-ide-healthcheck] ${SVC} state=${state} — leaving to systemd"
+  exit 0
+fi
+
+# Three tries with a 5s timeout each — survives transient slow responses
+# (Next.js compile-on-demand can spike under load on t3.small/medium)
+# without restart-storming.
+for attempt in 1 2 3; do
+  if curl -fsS --max-time 5 "http://localhost:${PORT}/" >/dev/null 2>&1; then
+    exit 0
+  fi
+  sleep 2
+done
+
+echo "[ai-ide-healthcheck] ${SVC} unresponsive on :${PORT} after 3 attempts — restarting"
+systemctl restart "$SVC"
+HEALTH_EOF
+chmod 755 /usr/local/bin/ai-ide-healthcheck.sh
+ok "Healthcheck script installed at /usr/local/bin/ai-ide-healthcheck.sh"
+
+for pair in "backend:${BACKEND_PORT}" "frontend:${FRONTEND_PORT}"; do
+  svc="${pair%%:*}"
+  port="${pair##*:}"
+  cat > "/etc/systemd/system/ai-ide-${svc}-healthcheck.service" <<EOF
+[Unit]
+Description=Healthcheck for ai-ide-${svc} (restart if port :${port} stops answering)
+After=ai-ide-${svc}.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/ai-ide-healthcheck.sh ${svc} ${port}
+EOF
+  cat > "/etc/systemd/system/ai-ide-${svc}-healthcheck.timer" <<EOF
+[Unit]
+Description=Periodic healthcheck for ai-ide-${svc}
+
+[Timer]
+# 120s boot delay so Next/Hono dev servers have time to do their first
+# compile (can take 30-60s on a t3.small/medium under cold-start load).
+OnBootSec=120
+OnUnitActiveSec=30s
+Unit=ai-ide-${svc}-healthcheck.service
+
+[Install]
+WantedBy=timers.target
+EOF
+done
+
+systemctl daemon-reload
+systemctl enable --now ai-ide-backend-healthcheck.timer
+systemctl enable --now ai-ide-frontend-healthcheck.timer
+ok "Healthcheck timers enabled (30s interval, 120s boot delay)"
 
 # Give the services a moment to start, then sanity-check
 sleep 5
