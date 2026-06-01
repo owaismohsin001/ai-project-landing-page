@@ -76,7 +76,7 @@ export function SignupForm({ sessionId }: { sessionId: string }) {
   if (status === "loading") {
     return (
       <AuthLayout title="Almost there" subtitle="Verifying your purchase…">
-        <div className="h-24 animate-pulse rounded-lg bg-white/5" />
+        <div className="h-24 animate-pulse rounded-lg bg-slate-100 dark:bg-white/5" />
       </AuthLayout>
     );
   }
@@ -108,7 +108,7 @@ export function SignupForm({ sessionId }: { sessionId: string }) {
 
           {hasSession ? (
             <>
-              <p className="text-sm text-slate-400">
+              <p className="text-sm text-slate-600 dark:text-slate-400">
                 A payment can take a few seconds to settle. Wait a moment, then
                 retry — you won&apos;t be charged again.
               </p>
@@ -121,14 +121,14 @@ export function SignupForm({ sessionId }: { sessionId: string }) {
               </button>
               <Link
                 href="/#pricing"
-                className="block text-center text-sm text-slate-400 transition hover:text-white"
+                className="block text-center text-sm text-slate-500 transition hover:text-slate-900 dark:text-slate-400 dark:hover:text-white"
               >
                 Back to plans
               </Link>
             </>
           ) : (
             <>
-              <p className="text-sm text-slate-400">
+              <p className="text-sm text-slate-600 dark:text-slate-400">
                 To create an account you need an active membership. Pick a plan
                 and complete checkout — you&apos;ll land back here automatically.
               </p>
@@ -173,7 +173,7 @@ export function SignupForm({ sessionId }: { sessionId: string }) {
             disabled
             className={fieldClass}
           />
-          <p className="mt-1 text-xs text-slate-500">
+          <p className="mt-1 text-xs text-slate-500 dark:text-slate-500">
             Linked to your purchase and cannot be changed.
           </p>
         </div>

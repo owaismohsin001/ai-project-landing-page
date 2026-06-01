@@ -1,13 +1,14 @@
 import Link from "next/link";
 import { APP_NAME } from "@/lib/config";
+import { ThemeToggle } from "./ThemeToggle";
 
 export function Navbar() {
   return (
-    <header className="sticky top-0 z-40 border-b border-white/5 bg-ink-900/80 backdrop-blur">
+    <header className="sticky top-0 z-40 border-b border-slate-200 bg-white/80 backdrop-blur dark:border-white/5 dark:bg-ink-900/80">
       <nav className="mx-auto flex h-16 max-w-6xl items-center justify-between px-6">
         <Link
           href="/"
-          className="flex items-center gap-2 text-lg font-semibold text-white"
+          className="flex items-center gap-2 text-lg font-semibold text-slate-900 dark:text-white"
         >
           <span className="grid h-8 w-8 place-items-center rounded-lg bg-brand-600 text-sm font-bold text-white">
             {APP_NAME.charAt(0).toUpperCase()}
@@ -18,19 +19,19 @@ export function Navbar() {
         <div className="flex items-center gap-6 text-sm">
           <Link
             href="/#features"
-            className="hidden text-slate-300 transition hover:text-white sm:block"
+            className="hidden text-slate-600 transition hover:text-slate-900 sm:block dark:text-slate-300 dark:hover:text-white"
           >
             Features
           </Link>
           <Link
             href="/#pricing"
-            className="hidden text-slate-300 transition hover:text-white sm:block"
+            className="hidden text-slate-600 transition hover:text-slate-900 sm:block dark:text-slate-300 dark:hover:text-white"
           >
             Pricing
           </Link>
           <Link
             href="/login"
-            className="text-slate-300 transition hover:text-white"
+            className="text-slate-600 transition hover:text-slate-900 dark:text-slate-300 dark:hover:text-white"
           >
             Log in
           </Link>
@@ -40,6 +41,7 @@ export function Navbar() {
           >
             Get started
           </Link>
+          <ThemeToggle />
         </div>
       </nav>
     </header>

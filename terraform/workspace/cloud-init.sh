@@ -247,6 +247,34 @@ cert: false
 EOF
 chown -R "${TARGET_USER}:${TARGET_USER}" "${TARGET_HOME}/.config"
 
+# ---- User-level VS Code settings ----
+# Hide the things the user doesn't want polluting the workspace when they
+# open code-server for the first time:
+#   - workbench.startupEditor=none        → no Welcome / "Get Started" tab
+#   - window.menuBarVisibility=hidden     → hides the top File/Edit/View menu bar
+#   - workbench.layoutControl.enabled=false → hides layout-control buttons in title
+#   - chat.commandCenter.enabled=false    → hides AI chat in title bar
+# Secondary side bar (the right-side panel where Copilot / Cline / Continue
+# put their chat) is closed by default — once the user closes it manually it
+# stays closed across sessions. There's no global setting to force-hide it.
+log "Writing code-server user settings.json (hide welcome / menu bar / chat panel)"
+readonly CODE_USER_DIR="${TARGET_HOME}/.local/share/code-server/User"
+as_user mkdir -p "$CODE_USER_DIR"
+cat > "${CODE_USER_DIR}/settings.json" <<'EOF'
+{
+  "workbench.startupEditor": "none",
+  "window.menuBarVisibility": "hidden",
+  "workbench.layoutControl.enabled": false,
+  "chat.commandCenter.enabled": false,
+  "workbench.tips.enabled": false,
+  "workbench.welcomePage.walkthroughs.openOnInstall": false,
+  "update.showReleaseNotes": false,
+  "extensions.autoCheckUpdates": false,
+  "security.workspace.trust.enabled": false
+}
+EOF
+chown -R "${TARGET_USER}:${TARGET_USER}" "${TARGET_HOME}/.local/share/code-server"
+
 ok "code-server $(code-server --version 2>/dev/null | head -1) ready"
 done_step "Step 4 / 8 — code-server"
 
@@ -383,7 +411,20 @@ EOF
 # Reload + enable + start
 systemctl daemon-reload
 
-# code-server ships its own unit at code-server@.service — enable for our user
+# code-server ships its own unit at code-server@.service — drop in an
+# override so it starts with the project directory open by default. That
+# way the user lands directly in /home/<user>/AI-IDE instead of seeing
+# the "Open Folder" placeholder.
+log "Configuring code-server to open ${PROJECT_DIR} by default"
+mkdir -p "/etc/systemd/system/code-server@${TARGET_USER}.service.d"
+cat > "/etc/systemd/system/code-server@${TARGET_USER}.service.d/override.conf" <<EOF
+[Service]
+# Clear the default ExecStart so we don't end up with two of them.
+ExecStart=
+ExecStart=/usr/bin/code-server ${PROJECT_DIR}
+EOF
+systemctl daemon-reload
+
 log "Enabling code-server@${TARGET_USER}"
 systemctl enable --now "code-server@${TARGET_USER}" || true
 
