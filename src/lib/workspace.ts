@@ -191,11 +191,28 @@ async function waitForWorkspaceReady(
   url: string,
   onProgress?: (pct: number) => void | Promise<void>
 ): Promise<void> {
-  const INTERVAL_MS = 5_000;
-  const MAX_WAIT_MS = 15 * 60_000; // 15 minutes worst-case (slow apt + npm)
-  const REQUEST_TIMEOUT_MS = 10_000;
+  // How often we hit the URL. 3s strikes a balance between snappy
+  // detection-of-ready and not hammering Traefik / Cloudflare during the
+  // long cloud-init window.
+  const INTERVAL_MS = 3_000;
+  // Hard ceiling on the whole wait. Beyond 10 min something has likely
+  // gone wrong (cloud-init failure, IAM throttling, AMI issue) and the
+  // user is better off being shown the "ready" state with a stale URL —
+  // they can refresh / re-provision rather than stare at a frozen bar.
+  const MAX_WAIT_MS = 10 * 60_000;
+  // Per-request timeout. 8s is plenty for a healthy upstream and lets us
+  // move on quickly if Traefik is just hanging on a 502.
+  const REQUEST_TIMEOUT_MS = 8_000;
+  // Progress display range while we wait.
   const RANGE_START = 95;
   const RANGE_END = 99;
+  // We map the progress *display* over a SHORTER window than the actual
+  // max wait. The bar reaches 99 in ~3 minutes regardless of whether the
+  // URL is actually up yet, so the user sees clear movement during the
+  // longest part of provisioning instead of "stuck at 95%" for 10+ min.
+  // After hitting 99 the bar parks there until the URL responds, at
+  // which point the caller flips status to "ready" and progress to 100.
+  const PROGRESS_RAMP_MS = 3 * 60_000;
 
   const startedAt = Date.now();
   let attempt = 0;
@@ -225,26 +242,32 @@ async function waitForWorkspaceReady(
     }
 
     if (alive) {
+      // URL responded — jump straight to RANGE_END so the bar finishes
+      // its run, then return. The caller flips status to "ready" and
+      // progress to 100 in a single DB write right after this.
       if (onProgress) await onProgress(RANGE_END);
       console.log(
-        `[workspace] waitForWorkspaceReady: ${url} responded on attempt ${attempt}`
+        `[workspace] waitForWorkspaceReady: ${url} responded on attempt ${attempt} (${Math.round((Date.now() - startedAt) / 1000)}s)`
       );
       return;
     }
 
-    // Ramp progress slowly through the wait window.
+    // Ramp progress over PROGRESS_RAMP_MS, capped at RANGE_END. Ceil so
+    // sub-integer increments aren't rounded out — without this, each
+    // 3s poll bumped pct by ~0.07% and the persistence layer rounded
+    // every value back to 95 for the first ~13 minutes.
     if (onProgress) {
       const elapsed = Date.now() - startedAt;
-      const frac = Math.min(1, elapsed / MAX_WAIT_MS);
-      const pct = RANGE_START + frac * (RANGE_END - RANGE_START);
-      await onProgress(pct);
+      const frac = Math.min(1, elapsed / PROGRESS_RAMP_MS);
+      const raw = RANGE_START + frac * (RANGE_END - RANGE_START);
+      await onProgress(Math.min(RANGE_END, Math.ceil(raw)));
     }
 
     await new Promise((r) => setTimeout(r, INTERVAL_MS));
   }
 
   console.warn(
-    `[workspace] waitForWorkspaceReady: gave up after ${MAX_WAIT_MS / 1000}s on ${url} — user may see a brief 502`
+    `[workspace] waitForWorkspaceReady: gave up after ${MAX_WAIT_MS / 1000}s on ${url} — user may see a brief 502 on Open workspace`
   );
 }
 
@@ -304,10 +327,16 @@ export async function provisionWorkspace(
   // when it writes status="ready" to the DB. That separation guarantees
   // the bar never reads "100% complete" before the workspace document is
   // actually persisted with the EC2 / S3 / IAM details the dashboard reads.
+  //
+  // Math.ceil instead of Math.round: small ramp increments (e.g. 95.05,
+  // 95.10, 95.15 ... over the wait phase) were getting rounded back to 95
+  // and never advanced the UI. Ceil moves us up as soon as we cross any
+  // integer boundary — once we hit 95.01, the bar shows 96. The 99 cap
+  // keeps that from overshooting.
   const reportProgress = async (pct: number) => {
     if (!onProgress) return;
     try {
-      await onProgress(Math.min(99, Math.max(0, Math.round(pct))));
+      await onProgress(Math.min(99, Math.max(0, Math.ceil(pct))));
     } catch {
       /* ignore */
     }
@@ -457,19 +486,24 @@ export async function provisionUserWorkspace(
     }
   );
 
-  // Coalesce rapid-fire progress updates so we don't hammer Mongo. The bar
-  // updates visually every poll (the dashboard polls every 5s), so writing
-  // more often than ~1s adds load without improving UX.
+  // Coalesce progress updates so we don't hammer Mongo. The previous
+  // throttle ("skip if delta < 5%") meant the 95→99 wait-phase ramp —
+  // which advances by ~1% at a time — was always below the threshold and
+  // never wrote anything, so the bar visibly froze at 95% for the whole
+  // wait. New rule:
+  //   - Always write when the integer value changes (so every 1% bump
+  //     shows up in the next dashboard poll).
+  //   - Otherwise, heartbeat every 5s so a slow ramp still writes once
+  //     in a while (useful when the cap-99 plateau is reached and we're
+  //     just holding pattern).
   let lastWritten = -1;
   let lastWriteAt = 0;
   const persistProgress = async (pct: number) => {
     const now = Date.now();
-    // Always persist the first update + any >= 5% delta, throttle the rest
-    // to at most once per ~750ms.
     const isFirst = lastWritten < 0;
-    const bigDelta = Math.abs(pct - lastWritten) >= 5;
-    const elapsed = now - lastWriteAt;
-    if (!isFirst && !bigDelta && elapsed < 750) return;
+    const changed = pct !== lastWritten;
+    const heartbeat = now - lastWriteAt >= 5_000;
+    if (!isFirst && !changed && !heartbeat) return;
     lastWritten = pct;
     lastWriteAt = now;
     await User.updateOne(

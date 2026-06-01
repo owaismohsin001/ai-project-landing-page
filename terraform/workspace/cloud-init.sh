@@ -414,16 +414,17 @@ EOF
 systemctl daemon-reload
 
 # code-server ships its own unit at code-server@.service — drop in an
-# override so it starts with the project directory open by default. That
-# way the user lands directly in /home/<user>/AI-IDE instead of seeing
-# the "Open Folder" placeholder.
-log "Configuring code-server to open ${PROJECT_DIR} by default"
+# override so it starts with the user's home directory open by default.
+# That way the Explorer shows the full filesystem (AI-IDE/, .config/,
+# .claude/, ...) and the user can pick whichever subfolder they want
+# instead of seeing the "Open Folder" placeholder.
+log "Configuring code-server to open ${TARGET_HOME} by default"
 mkdir -p "/etc/systemd/system/code-server@${TARGET_USER}.service.d"
 cat > "/etc/systemd/system/code-server@${TARGET_USER}.service.d/override.conf" <<EOF
 [Service]
 # Clear the default ExecStart so we don't end up with two of them.
 ExecStart=
-ExecStart=/usr/bin/code-server ${PROJECT_DIR}
+ExecStart=/usr/bin/code-server ${TARGET_HOME}
 EOF
 systemctl daemon-reload
 
