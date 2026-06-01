@@ -106,9 +106,16 @@ interface TerraformResult {
   stderr: string;
 }
 
+/**
+ * Spawn a terraform command. If `onLine` is supplied, each newline-terminated
+ * stdout chunk is forwarded to it as it arrives — used for streaming progress
+ * updates during `terraform apply`. Without `onLine`, output is just buffered
+ * up and returned at the end as before.
+ */
 function runTerraform(
   cwd: string,
-  args: string[]
+  args: string[],
+  onLine?: (line: string) => void
 ): Promise<TerraformResult> {
   return new Promise((resolve, reject) => {
     const proc = spawn(TERRAFORM_BIN, args, {
@@ -118,23 +125,38 @@ function runTerraform(
     });
     let stdout = "";
     let stderr = "";
+    // Partial line buffer — terraform writes in chunks that don't line up
+    // with line boundaries, so we hold the trailing fragment until the next
+    // chunk completes it.
+    let lineBuf = "";
     proc.stdout.on("data", (d) => {
-      stdout += d.toString();
+      const chunk = d.toString();
+      stdout += chunk;
+      if (!onLine) return;
+      lineBuf += chunk;
+      const lines = lineBuf.split("\n");
+      lineBuf = lines.pop() ?? "";
+      for (const line of lines) onLine(line);
     });
     proc.stderr.on("data", (d) => {
       stderr += d.toString();
     });
     proc.on("error", reject);
-    proc.on("close", (code) => resolve({ code: code ?? 1, stdout, stderr }));
+    proc.on("close", (code) => {
+      // Flush any pending partial line.
+      if (onLine && lineBuf) onLine(lineBuf);
+      resolve({ code: code ?? 1, stdout, stderr });
+    });
   });
 }
 
 async function expectTerraform(
   cwd: string,
   args: string[],
-  label: string
+  label: string,
+  onLine?: (line: string) => void
 ): Promise<TerraformResult> {
-  const result = await runTerraform(cwd, args);
+  const result = await runTerraform(cwd, args, onLine);
   if (result.code !== 0) {
     throw new Error(
       `${label} failed (code ${result.code}):\n${result.stderr || result.stdout}`
@@ -174,7 +196,12 @@ const TRAEFIK_ROUTER_BASE_URL =
   "http://localhost:9100/api/traefik/user";
 
 export async function provisionWorkspace(
-  input: ProvisionInput
+  input: ProvisionInput,
+  /** Optional callback invoked with a 0-100 percentage as terraform makes
+   *  observable progress. Stay under 95 — the caller flips to 100 only
+   *  once status transitions to "ready" so the bar can never claim "done"
+   *  before the DB write that records the workspace details. */
+  onProgress?: (pct: number) => void | Promise<void>
 ): Promise<WorkspaceOutputs> {
   if (!isAwsConfigured()) {
     throw new Error(
@@ -185,6 +212,20 @@ export async function provisionWorkspace(
   if (!instanceType) {
     throw new Error(`No instance type mapped for plan "${input.plan}".`);
   }
+
+  // Wrap the optional callback so the rest of this function can call it
+  // unconditionally + swallow any error from a slow DB write (we never
+  // want a progress-tracking failure to abort actual provisioning).
+  const reportProgress = async (pct: number) => {
+    if (!onProgress) return;
+    try {
+      await onProgress(Math.min(95, Math.max(0, Math.round(pct))));
+    } catch {
+      /* ignore */
+    }
+  };
+
+  await reportProgress(2);
 
   const dir = await workspaceDir(input.userId);
   await copyModuleInto(dir);
@@ -204,16 +245,58 @@ export async function provisionWorkspace(
     ),
   });
 
+  await reportProgress(5);
+
   await expectTerraform(
     dir,
     ["init", "-input=false", "-no-color"],
     "terraform init"
   );
+
+  await reportProgress(15);
+
+  // Stream terraform-apply stdout and translate it into a 15→90 % ramp.
+  // The plan line ("Plan: N to add, …") tells us how many resources are
+  // about to be created; we map each "Creation complete" line to a
+  // proportional bump. If for some reason we never see the plan line, we
+  // fall back to bumping a fixed amount per completed resource.
+  let totalResources = 0;
+  let resourcesCreated = 0;
+  // 75% range of progress is shared across all resources during apply.
+  const APPLY_RANGE_START = 15;
+  const APPLY_RANGE_END = 90;
+  const APPLY_RANGE = APPLY_RANGE_END - APPLY_RANGE_START;
+
+  const onApplyLine = (line: string) => {
+    // "Plan: 10 to add, 0 to change, 0 to destroy."
+    const planMatch = line.match(/^Plan:\s+(\d+)\s+to add\b/);
+    if (planMatch) {
+      totalResources = parseInt(planMatch[1], 10);
+      void reportProgress(APPLY_RANGE_START + 2);
+      return;
+    }
+    // "aws_iam_user.workspace: Creation complete after 1s [id=…]"
+    if (/:\s+Creation complete after\b/.test(line)) {
+      resourcesCreated += 1;
+      const denom = totalResources > 0 ? totalResources : resourcesCreated + 3;
+      const pct = APPLY_RANGE_START + (resourcesCreated / denom) * APPLY_RANGE;
+      void reportProgress(pct);
+      return;
+    }
+    // "Apply complete! Resources: 10 added, 0 changed, 0 destroyed."
+    if (/^Apply complete!/.test(line)) {
+      void reportProgress(90);
+    }
+  };
+
   await expectTerraform(
     dir,
     ["apply", "-input=false", "-auto-approve", "-no-color"],
-    "terraform apply"
+    "terraform apply",
+    onApplyLine
   );
+
+  await reportProgress(92);
 
   const out = await expectTerraform(
     dir,
@@ -221,6 +304,8 @@ export async function provisionWorkspace(
     "terraform output"
   );
   const outputs = JSON.parse(out.stdout) as Record<string, { value: string }>;
+
+  await reportProgress(95);
 
   return {
     instanceId: outputs.instance_id.value,
@@ -269,18 +354,43 @@ export async function provisionUserWorkspace(
   await User.updateOne(
     { _id: userIdStr },
     {
-      $set: { workspaceStatus: "provisioning" },
+      $set: { workspaceStatus: "provisioning", workspaceProgress: 0 },
       $unset: { workspaceError: "" },
     }
   );
 
+  // Coalesce rapid-fire progress updates so we don't hammer Mongo. The bar
+  // updates visually every poll (the dashboard polls every 5s), so writing
+  // more often than ~1s adds load without improving UX.
+  let lastWritten = -1;
+  let lastWriteAt = 0;
+  const persistProgress = async (pct: number) => {
+    const now = Date.now();
+    // Always persist the first update + any >= 5% delta, throttle the rest
+    // to at most once per ~750ms.
+    const isFirst = lastWritten < 0;
+    const bigDelta = Math.abs(pct - lastWritten) >= 5;
+    const elapsed = now - lastWriteAt;
+    if (!isFirst && !bigDelta && elapsed < 750) return;
+    lastWritten = pct;
+    lastWriteAt = now;
+    await User.updateOne(
+      { _id: userIdStr },
+      { $set: { workspaceProgress: pct } }
+    );
+  };
+
   try {
-    const out = await provisionWorkspace({ userId: userIdStr, plan });
+    const out = await provisionWorkspace(
+      { userId: userIdStr, plan },
+      persistProgress
+    );
     await User.updateOne(
       { _id: userIdStr },
       {
         $set: {
           workspaceStatus: "ready",
+          workspaceProgress: 100,
           workspace: {
             instanceId: out.instanceId,
             publicIp: out.publicIp,
@@ -302,6 +412,7 @@ export async function provisionUserWorkspace(
       {
         $set: {
           workspaceStatus: "failed",
+          workspaceProgress: 0,
           workspaceError: err instanceof Error ? err.message : String(err),
         },
       }

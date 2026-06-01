@@ -24,7 +24,7 @@ export async function GET() {
 
   await connectToDatabase();
   const user = await User.findById(session.sub).select(
-    "workspaceStatus workspaceError workspace"
+    "workspaceStatus workspaceError workspaceProgress workspace"
   );
   if (!user) {
     return NextResponse.json({ error: "Not found." }, { status: 404 });
@@ -44,6 +44,10 @@ export async function GET() {
   return NextResponse.json({
     status: user.workspaceStatus ?? "none",
     error: user.workspaceError ?? null,
+    // Real provisioning progress (0-100) — written by the background
+    // terraform driver as each resource finishes creating. Falls back to
+    // 0 when no provisioning is in flight; 100 once the workspace is ready.
+    progress: user.workspaceProgress ?? 0,
     workspace,
   });
 }

@@ -14,6 +14,11 @@ interface WorkspaceData {
 interface WorkspaceState {
   status: string;
   error: string | null;
+  /** Real 0-100 progress reported by the backend's terraform driver.
+   *  Optional for backward compatibility with older API responses that
+   *  predate this field — when missing, we fall back to a time-based
+   *  ramp so the bar still moves. */
+  progress?: number;
   workspace: WorkspaceData | null;
 }
 
@@ -32,9 +37,17 @@ export function WorkspaceCard({ initial }: Props) {
   const [confirmOpen, setConfirmOpen] = useState(false);
   const timer = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  // Time-based fake progress for the provisioning bar. Caps at 95% so we never
-  // claim "done" before the backend actually reports ready — the jump to 100%
-  // happens when status transitions to "ready".
+  // Progress bar driver.
+  //
+  // Preferred path (current backend): use the real `progress` field the API
+  // returns — written by the terraform driver as each AWS resource finishes
+  // creating. The bar updates in lockstep with what's actually happening.
+  //
+  // Fallback path (old API responses missing `progress`, or first few seconds
+  // before the backend writes anything): nudge forward with a slow time-based
+  // ramp so the bar still moves and doesn't look stuck at 0%. The ramp is
+  // gentle (caps at 25% over ~30s) — once a real backend progress value
+  // arrives, that takes over.
   useEffect(() => {
     if (state.status === "ready") {
       setProgress(100);
@@ -44,15 +57,28 @@ export function WorkspaceCard({ initial }: Props) {
       setProgress(0);
       return;
     }
+
+    // Prefer backend-reported progress when present and meaningful (>0).
+    const backendProgress = typeof state.progress === "number" ? state.progress : 0;
+    if (backendProgress > 0) {
+      setProgress((prev) => Math.max(prev, Math.min(95, backendProgress)));
+      return;
+    }
+
+    // No backend value yet → gentle local ramp 0→25% over ~30s so the bar
+    // moves while we wait for the first persisted update.
     const startedAt = Date.now();
     const tick = () => {
       const elapsed = Date.now() - startedAt;
-      setProgress(Math.min(95, (elapsed / 240_000) * 100));
+      setProgress((prev) => {
+        const target = Math.min(25, (elapsed / 30_000) * 25);
+        return Math.max(prev, target);
+      });
     };
     tick();
     const id = setInterval(tick, 800);
     return () => clearInterval(id);
-  }, [state.status]);
+  }, [state.status, state.progress]);
 
   const refresh = useCallback(async () => {
     try {
@@ -66,10 +92,14 @@ export function WorkspaceCard({ initial }: Props) {
   }, []);
 
   // Initial refresh on mount, plus polling whenever the status is in-flight.
+  // 2s interval (down from 5s) so the progress bar visibly catches up with
+  // each resource the terraform driver finishes — at 5s a fast apply was
+  // landing 60-70% of resources between polls, which is why the bar used
+  // to look stuck and then snap straight to "ready".
   useEffect(() => {
     refresh();
     if (POLLING_STATUSES.has(state.status)) {
-      timer.current = setInterval(refresh, 5000);
+      timer.current = setInterval(refresh, 2000);
     }
     return () => {
       if (timer.current) {

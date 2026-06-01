@@ -27,6 +27,11 @@ export interface IUser {
   /** Workspace lifecycle: provisioning | ready | failed | destroying | destroyed. */
   workspaceStatus?: string;
   workspaceError?: string;
+  /** Real-time progress percentage (0-100) while provisioning is in flight.
+   *  Updated by the background terraform driver as each resource finishes
+   *  creating, so the dashboard can show actual progress instead of a
+   *  faked time-based ramp. Reset to 0 when not provisioning. */
+  workspaceProgress?: number;
   workspace?: IUserWorkspace;
   resetTokenHash?: string;
   resetTokenExpiry?: Date;
@@ -64,6 +69,7 @@ const userSchema = new Schema<IUser>(
     subscriptionStatus: { type: String, default: "active" },
     workspaceStatus: { type: String },
     workspaceError: { type: String },
+    workspaceProgress: { type: Number, default: 0, min: 0, max: 100 },
     workspace: { type: workspaceSchema },
     resetTokenHash: { type: String },
     resetTokenExpiry: { type: Date },
