@@ -173,10 +173,10 @@ free -h | indent
 done_step "Step 0 — Swap"
 
 # ────────────────────────────────────────────────────────────────────
-# Step 1 / 8 — apt base packages
+# Step 1 / 9 — apt base packages
 # ────────────────────────────────────────────────────────────────────
 
-hdr "Step 1 / 8 — apt base packages"
+hdr "Step 1 / 9 — apt base packages"
 
 export DEBIAN_FRONTEND=noninteractive
 
@@ -189,13 +189,13 @@ apt-get install -y \
   build-essential python3 unzip 2>&1 | indent
 
 ok "Base packages installed"
-done_step "Step 1 / 8 — apt base packages"
+done_step "Step 1 / 9 — apt base packages"
 
 # ────────────────────────────────────────────────────────────────────
-# Step 2 / 8 — Node.js 20 LTS
+# Step 2 / 9 — Node.js 20 LTS
 # ────────────────────────────────────────────────────────────────────
 
-hdr "Step 2 / 8 — Node.js ${NODE_MAJOR} LTS"
+hdr "Step 2 / 9 — Node.js ${NODE_MAJOR} LTS"
 
 if command -v node >/dev/null && [ "$(node -v | sed -E 's/^v([0-9]+)\..*/\1/')" -ge "$NODE_MAJOR" ]; then
   skip "node $(node -v) already installed"
@@ -207,13 +207,13 @@ else
 fi
 
 ok "node $(node -v) / npm $(npm -v) ready"
-done_step "Step 2 / 8 — Node.js"
+done_step "Step 2 / 9 — Node.js"
 
 # ────────────────────────────────────────────────────────────────────
-# Step 3 / 8 — Claude Code CLI
+# Step 3 / 9 — Claude Code CLI
 # ────────────────────────────────────────────────────────────────────
 
-hdr "Step 3 / 8 — Claude Code CLI"
+hdr "Step 3 / 9 — Claude Code CLI"
 
 if command -v claude >/dev/null; then
   skip "claude already installed"
@@ -223,13 +223,13 @@ else
 fi
 
 ok "claude $(claude --version 2>/dev/null | head -1 || echo unknown)"
-done_step "Step 3 / 8 — Claude Code CLI"
+done_step "Step 3 / 9 — Claude Code CLI"
 
 # ────────────────────────────────────────────────────────────────────
-# Step 4 / 8 — code-server
+# Step 4 / 9 — code-server
 # ────────────────────────────────────────────────────────────────────
 
-hdr "Step 4 / 8 — code-server (VS Code in browser)"
+hdr "Step 4 / 9 — code-server (VS Code in browser)"
 
 if command -v code-server >/dev/null; then
   skip "code-server already installed"
@@ -278,13 +278,13 @@ EOF
 chown -R "${TARGET_USER}:${TARGET_USER}" "${TARGET_HOME}/.local/share/code-server"
 
 ok "code-server $(code-server --version 2>/dev/null | head -1) ready"
-done_step "Step 4 / 8 — code-server"
+done_step "Step 4 / 9 — code-server"
 
 # ────────────────────────────────────────────────────────────────────
-# Step 5 / 8 — Clone repos
+# Step 5 / 9 — Clone repos
 # ────────────────────────────────────────────────────────────────────
 
-hdr "Step 5 / 8 — Clone backend + frontend repos"
+hdr "Step 5 / 9 — Clone backend + frontend repos"
 
 as_user mkdir -p "$PROJECT_DIR"
 
@@ -303,13 +303,13 @@ clone_or_pull "$REPO_BACKEND"  "${PROJECT_DIR}/backend"  "backend"
 clone_or_pull "$REPO_FRONTEND" "${PROJECT_DIR}/frontend" "frontend"
 
 ok "Both repos checked out under ${PROJECT_DIR}"
-done_step "Step 5 / 8 — Clone repos"
+done_step "Step 5 / 9 — Clone repos"
 
 # ────────────────────────────────────────────────────────────────────
-# Step 6 / 8 — npm install (frontend + backend)
+# Step 6 / 9 — npm install (frontend + backend)
 # ────────────────────────────────────────────────────────────────────
 
-hdr "Step 6 / 8 — npm install (this can take 2-5 minutes)"
+hdr "Step 6 / 9 — npm install (this can take 2-5 minutes)"
 
 # Both repos pin the China npm mirror (registry.npmmirror.com) in their
 # .npmrc and in lockfile `resolved` URLs. That mirror returns 503 constantly
@@ -334,13 +334,13 @@ log "frontend: npm install (downloading packages...)"
 as_user bash -lc "cd ${PROJECT_DIR}/frontend && npm install $NPM_FLAGS" 2>&1 | indent
 ok "frontend dependencies installed"
 
-done_step "Step 6 / 8 — npm install"
+done_step "Step 6 / 9 — npm install"
 
 # ────────────────────────────────────────────────────────────────────
-# Step 7 / 8 — systemd services
+# Step 7 / 9 — systemd services
 # ────────────────────────────────────────────────────────────────────
 
-hdr "Step 7 / 8 — systemd services (backend + frontend + code-server)"
+hdr "Step 7 / 9 — systemd services (backend + frontend + code-server)"
 
 # --- Backend service ---
 # Pulls INSTANCE_ID / INSTANCE_IP / INSTANCE_URL / BUCKET_ID / AWS_REGION /
@@ -448,10 +448,10 @@ for svc in "code-server@${TARGET_USER}" ai-ide-backend ai-ide-frontend; do
   fi
 done
 
-done_step "Step 7 / 8 — systemd services"
+done_step "Step 7 / 9 — systemd services"
 
 # ────────────────────────────────────────────────────────────────────
-# Step 8 / 8 — Docker + Playwright (+ Chromium) container
+# Step 8 / 9 — Docker + Playwright (+ Chromium) container
 # ────────────────────────────────────────────────────────────────────
 #
 # Installs Docker Engine via the official Docker apt repo, then runs a
@@ -462,7 +462,7 @@ done_step "Step 7 / 8 — systemd services"
 # Self-contained: the docker-compose.yml is written inline so this step
 # doesn't depend on cloning the AI-IDE meta-repo.
 
-hdr "Step 8 / 8 — Docker + Playwright + Chromium container"
+hdr "Step 8 / 9 — Docker + Playwright + Chromium container"
 
 readonly PLAYWRIGHT_DIR="${PROJECT_DIR}/playwright"
 readonly PLAYWRIGHT_IMAGE="mcr.microsoft.com/playwright:v1.49.0-jammy"
@@ -554,7 +554,91 @@ else
   err "    docker compose -f ${PLAYWRIGHT_DIR}/docker-compose.yml logs"
 fi
 
-done_step "Step 8 / 8 — Playwright Docker container"
+done_step "Step 8 / 9 — Playwright Docker container"
+
+# ────────────────────────────────────────────────────────────────────
+# Step 9 / 9 — Service boot-restoration (tmux recipes survive reboots)
+# ────────────────────────────────────────────────────────────────────
+#
+# Every long-running project the user starts via Claude (dev servers,
+# Odoo, Python apps, etc.) is wrapped in tmux per the system-prompt
+# persistence rule. tmux survives browser close, but NOT EC2 reboots.
+#
+# This step installs the missing piece: a systemd oneshot that runs on
+# boot, iterates `~/<user>/.ai-ide/services/*.sh` recipes, and starts
+# each in a fresh tmux session named after the recipe.
+
+hdr "Step 9 / 9 — Service boot-restoration (tmux recipes)"
+
+if command -v tmux >/dev/null 2>&1; then
+  skip "tmux already installed ($(tmux -V))"
+else
+  log "Installing tmux"
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -qq 2>&1 | indent
+  apt-get install -y --no-install-recommends tmux 2>&1 | indent
+  ok "tmux installed: $(tmux -V)"
+fi
+
+log "Creating recipes folder at ${TARGET_HOME}/.ai-ide/services/"
+as_user mkdir -p "${TARGET_HOME}/.ai-ide/services"
+
+log "Installing /usr/local/bin/ai-ide-restart-services.sh"
+cat > /usr/local/bin/ai-ide-restart-services.sh <<'HELPER_EOF'
+#!/usr/bin/env bash
+# ai-ide-restart-services.sh — replay tmux recipes on boot.
+set -uo pipefail
+readonly TARGET_USER="${1:-ubuntu}"
+readonly TARGET_HOME="/home/${TARGET_USER}"
+readonly SERVICES_DIR="${TARGET_HOME}/.ai-ide/services"
+
+[ -d "$SERVICES_DIR" ] || { echo "[ai-ide-services] no ${SERVICES_DIR}"; exit 0; }
+command -v tmux >/dev/null 2>&1 || { echo "[ai-ide-services] tmux missing"; exit 1; }
+
+shopt -s nullglob
+recipes=("$SERVICES_DIR"/*.sh)
+[ ${#recipes[@]} -eq 0 ] && { echo "[ai-ide-services] no recipes"; exit 0; }
+
+sleep 5  # let postgres/docker fully accept connections
+
+for recipe in "${recipes[@]}"; do
+  name=$(basename "$recipe" .sh)
+  sudo -u "$TARGET_USER" tmux kill-session -t "$name" 2>/dev/null || true
+  echo "[ai-ide-services] starting recipe: $name"
+  sudo -u "$TARGET_USER" tmux new -d -s "$name" "bash '$recipe'" \
+    || echo "[ai-ide-services] WARN: failed $name"
+done
+
+echo "[ai-ide-services] done — ${#recipes[@]} recipe(s) launched"
+HELPER_EOF
+chmod 755 /usr/local/bin/ai-ide-restart-services.sh
+
+log "Installing /etc/systemd/system/ai-ide-services.service"
+cat > /etc/systemd/system/ai-ide-services.service <<EOF
+[Unit]
+Description=AI-IDE: replay user-registered tmux recipes after boot
+After=network-online.target docker.service postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/ai-ide-restart-services.sh ${TARGET_USER}
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable ai-ide-services.service 2>&1 | indent || true
+systemctl start ai-ide-services.service 2>&1 | indent || true
+
+chown -R "${TARGET_USER}:${TARGET_USER}" "${TARGET_HOME}/.ai-ide"
+
+ok "Boot-restoration service installed and enabled"
+done_step "Step 9 / 9 — Service boot-restoration"
 
 # ────────────────────────────────────────────────────────────────────
 # Make sure .claude/skills dir exists for future skill installs
