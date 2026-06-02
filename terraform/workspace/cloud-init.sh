@@ -478,8 +478,15 @@ fi
 # Three tries with a 5s timeout each — survives transient slow responses
 # (Next.js compile-on-demand can spike under load on t3.small/medium)
 # without restart-storming.
+# IMPORTANT: NO -f flag. We only care that the TCP/HTTP stack on the port
+# is responding — not that the URL returned 2xx. Backend's "/" is a 404
+# (only /api/* is routed) but the process is perfectly healthy; with -f
+# the healthcheck would false-restart every 30s and kill in-flight SSE.
+# Without -f, curl exits 0 on any HTTP response (200/302/401/404/5xx) and
+# non-zero only on connection-refused / timeout / DNS failure — exactly
+# the conditions that mean "service is actually dead/hung".
 for attempt in 1 2 3; do
-  if curl -fsS --max-time 5 "http://localhost:${PORT}/" >/dev/null 2>&1; then
+  if curl -sS --max-time 5 -o /dev/null "http://localhost:${PORT}/" 2>/dev/null; then
     exit 0
   fi
   sleep 2
