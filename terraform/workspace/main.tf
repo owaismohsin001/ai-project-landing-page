@@ -142,7 +142,7 @@ resource "aws_instance" "workspace" {
   }
 
   root_block_device {
-    volume_size           = 20
+    volume_size           = var.volume_size
     volume_type           = "gp3"
     delete_on_termination = true
 

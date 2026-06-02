@@ -19,6 +19,20 @@ variable "instance_type" {
   type        = string
 }
 
+variable "volume_size" {
+  description = "Root EBS volume size in GiB — sized by membership plan. Defaults to 20; lib/workspace.ts overrides per plan (e.g. Pro → 40)."
+  type        = number
+  default     = 20
+
+  validation {
+    # AMI's snapshot is ~8 GiB; cloud-init pulls Docker + Playwright +
+    # ONLYOFFICE images on top, which puts a realistic floor around 16.
+    # 200 GiB cap stops a typo from accidentally provisioning a huge disk.
+    condition     = var.volume_size >= 16 && var.volume_size <= 200
+    error_message = "volume_size must be between 16 and 200 GiB."
+  }
+}
+
 variable "name_prefix" {
   description = "Prefix applied to every resource name."
   type        = string

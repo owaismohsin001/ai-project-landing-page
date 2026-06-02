@@ -261,11 +261,49 @@ locals {
   })
 }
 
+# ─── SSM access for hot-iteration ─────────────────────────────────────
+# AmazonSSMManagedInstanceCore lets the SSM agent (pre-installed on the
+# Ubuntu Noble AMI) register with Systems Manager, which is what enables
+# `aws ssm start-session --target <instance-id>` without an SSH key. The
+# proxy EC2 was originally launched without a key_name, so SSM is the
+# practical way to shell in for hot-swap iteration on
+# /opt/traefik-router/bootstrap/cloud-init.sh — see proxy/README's
+# "iteration loop" section.
+resource "aws_iam_role" "proxy_ssm" {
+  name = "${local.resource_name}-ssm-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Principal = { Service = "ec2.amazonaws.com" }
+        Action = "sts:AssumeRole"
+      },
+    ]
+  })
+
+  tags = local.tags
+}
+
+resource "aws_iam_role_policy_attachment" "proxy_ssm" {
+  role       = aws_iam_role.proxy_ssm.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+}
+
+resource "aws_iam_instance_profile" "proxy_ssm" {
+  name = "${local.resource_name}-ssm-instance-profile"
+  role = aws_iam_role.proxy_ssm.name
+
+  tags = local.tags
+}
+
 resource "aws_instance" "proxy" {
   ami                         = data.aws_ami.ubuntu.id
   instance_type               = var.instance_type
   vpc_security_group_ids      = [aws_security_group.proxy.id]
   associate_public_ip_address = true
+  iam_instance_profile        = aws_iam_instance_profile.proxy_ssm.name
   user_data_base64            = base64gzip(local.user_data)
   user_data_replace_on_change = true
 

@@ -25,6 +25,20 @@ export const PLAN_INSTANCE_TYPES: Record<PlanId, string> = {
   premium: "t3.medium",
 };
 
+/**
+ * Root EBS volume size in GiB per plan. Pro and premium default to 40
+ * GiB because the workspace pulls multi-GB Docker images at cloud-init
+ * time (Playwright ~1.6 GB, two ONLYOFFICE Docs containers ~1.4 GB
+ * combined) on top of node_modules + code-server + apt packages —
+ * 20 GiB leaves very little headroom. Starter stays at 20 to keep the
+ * starter price point.
+ */
+export const PLAN_VOLUME_SIZES: Record<PlanId, number> = {
+  starter: 20,
+  pro: 40,
+  premium: 40,
+};
+
 export interface ProvisionInput {
   userId: string;
   plan: PlanId;
@@ -91,11 +105,18 @@ async function copyModuleInto(dir: string): Promise<void> {
 
 async function writeTfvars(
   dir: string,
-  vars: Record<string, string>
+  vars: Record<string, string | number>
 ): Promise<void> {
+  // Strings → JSON-quoted; numbers → unquoted literals. Terraform's
+  // tfvars parser respects the distinction and matches the variable
+  // type. Quoting a number works via implicit cast, but emitting the
+  // proper type avoids any future surprises in stricter Terraform
+  // versions or with downstream tooling that reads tfvars directly.
   const content =
     Object.entries(vars)
-      .map(([k, v]) => `${k} = ${JSON.stringify(v)}`)
+      .map(([k, v]) =>
+        typeof v === "number" ? `${k} = ${v}` : `${k} = ${JSON.stringify(v)}`
+      )
       .join("\n") + "\n";
   await fs.writeFile(path.join(dir, "terraform.tfvars"), content);
 }
@@ -318,6 +339,10 @@ export async function provisionWorkspace(
   if (!instanceType) {
     throw new Error(`No instance type mapped for plan "${input.plan}".`);
   }
+  const volumeSize = PLAN_VOLUME_SIZES[input.plan];
+  if (!volumeSize) {
+    throw new Error(`No volume size mapped for plan "${input.plan}".`);
+  }
 
   // Wrap the optional callback so the rest of this function can call it
   // unconditionally + swallow any error from a slow DB write (we never
@@ -350,6 +375,7 @@ export async function provisionWorkspace(
     region: process.env.AWS_REGION || "us-west-2",
     user_id: input.userId,
     instance_type: instanceType,
+    volume_size: volumeSize,
     platform_domain: PLATFORM_DOMAIN,
     platform_protocol: PLATFORM_PROTOCOL,
     backend_config_url: `${TRAEFIK_ROUTER_BASE_URL.replace(/\/+$/, "")}/${input.userId}`,
