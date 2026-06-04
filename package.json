@@ -12,6 +12,8 @@
     "workspace": "node --env-file=.env.local scripts/workspace.mjs"
   },
   "dependencies": {
+    "@aws-sdk/client-ec2": "^3.1062.0",
+    "@aws-sdk/client-ec2-instance-connect": "^3.1062.0",
     "bcryptjs": "^2.4.3",
     "jose": "^5.9.6",
     "mongoose": "^8.9.5",
