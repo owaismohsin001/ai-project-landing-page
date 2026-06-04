@@ -360,7 +360,16 @@ EnvironmentFile=/etc/workspace.env
 Environment=NODE_ENV=production
 Environment=HOST=0.0.0.0
 Environment=PORT=${BACKEND_PORT}
-ExecStart=/usr/bin/npm run dev
+# ExecStart uses tsx WITHOUT --watch. Previously this was \`npm run dev\`
+# which expands to \`tsx watch src/index.ts\` — a hot-reload mode. That was
+# fatal here because the in-chat agent edits backend source files all the
+# time (the user is BUILDING this IDE). Every Edit/Write would trip tsx's
+# file watcher, restart the process, wipe the in-memory TaskRegistry, and
+# drop every active stream — surfacing to the user as "Lost connection to
+# the chat task" + "Failed to start chat task". Run the production entry
+# point instead; if a developer wants hot reload, they stop the unit and
+# run \`npm run dev\` manually in a terminal.
+ExecStart=${PROJECT_DIR}/backend/node_modules/.bin/tsx src/index.ts
 # Restart=always catches BOTH crashes and clean exits (signal, OOM-with-exit-0).
 # StartLimitIntervalSec=0 disables the rate-limit that would otherwise stop
 # restarts after a few rapid failures. The "hung but alive" case (process up
