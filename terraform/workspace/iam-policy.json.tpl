@@ -66,6 +66,12 @@
         "arn:aws:s3:::${bucket_name}",
         "arn:aws:s3:::${bucket_name}/*"
       ]
+    },
+    {
+      "Sid": "EC2InstanceConnect",
+      "Effect": "Allow",
+      "Action": "ec2-instance-connect:SendSSHPublicKey",
+      "Resource": "arn:aws:ec2:${region}:*:instance/${instance_id}"
     }
   ]
 }
