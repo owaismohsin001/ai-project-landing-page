@@ -960,6 +960,283 @@ ok "Boot-restoration service installed and enabled"
 done_step "Step 9 / 9 — Service boot-restoration"
 
 # ────────────────────────────────────────────────────────────────────
+# Step 9.5 — Auto service-snapshot + restore on boot / apt update
+# ────────────────────────────────────────────────────────────────────
+#
+# Problem:  `apt upgrade` (or `apt-get dist-upgrade`) stops services that
+#           own upgraded packages — after the run (or reboot) those services
+#           stay down until someone manually restarts them.
+#
+# Solution:
+#   1. APT DPkg::Pre-Invoke  → snapshot every running systemd service
+#      and Docker container to /var/lib/service-manager/running-services.json
+#   2. APT DPkg::Post-Invoke → restore any service from the snapshot that
+#      is no longer active (covers upgrades that don't need a reboot)
+#   3. systemd oneshot       → restore on every boot (covers upgrades that
+#      require a reboot, or a manual `shutdown -r`)
+#
+# Manual use (SSH into the instance):
+#   sudo service-manager.sh save     — take a snapshot right now
+#   sudo service-manager.sh restore  — restore from last snapshot
+#   service-manager.sh status        — compare snapshot vs current state
+
+hdr "Step 9.5 — Auto service-snapshot + restore on boot/update"
+
+log "Writing /usr/local/bin/service-manager.sh"
+cat > /usr/local/bin/service-manager.sh <<'SVC_EOF'
+#!/usr/bin/env bash
+# service-manager.sh — snapshot + restore: systemd services, Docker containers, tmux sessions
+set -euo pipefail
+
+SNAPSHOT_DIR="/var/lib/service-manager"
+SNAPSHOT_FILE="$SNAPSHOT_DIR/running-services.json"
+LOG_FILE="$SNAPSHOT_DIR/service-manager.log"
+RECIPES_DIR="/home/ubuntu/.ai-ide/services"
+mkdir -p "$SNAPSHOT_DIR"
+
+_log() {
+  local ts; ts=$(date '+%Y-%m-%d %H:%M:%S')
+  local msg="[$ts] [${2:-INFO}] $1"
+  echo "$msg"
+  echo "$msg" >> "$LOG_FILE"
+}
+
+_docker_ok() { command -v docker &>/dev/null && docker info &>/dev/null 2>&1; }
+_tmux_ok()   { command -v tmux &>/dev/null; }
+
+cmd_save() {
+  _log "Snapshot save ho raha hai..."
+
+  # systemd services
+  mapfile -t svcs < <(
+    systemctl list-units --type=service --state=running --no-legend --plain \
+      | awk '{print $1}'
+  )
+  local svc_json="[" first=1
+  for s in "${svcs[@]}"; do
+    local desc; desc=$(systemctl show "$s" -p Description --value 2>/dev/null || true)
+    desc="${desc//\"/\\\"}"
+    [[ $first -eq 0 ]] && svc_json+=","
+    svc_json+="{\"name\":\"$s\",\"description\":\"$desc\"}"
+    first=0
+  done
+  svc_json+="]"
+
+  # Docker containers
+  local docker_json="[]"
+  if _docker_ok; then
+    local arr=()
+    while IFS='|' read -r name image; do
+      [[ -z "$name" ]] && continue
+      arr+=("{\"name\":\"$name\",\"image\":\"$image\"}")
+    done < <(docker ps --format '{{.Names}}|{{.Image}}' 2>/dev/null)
+    [[ ${#arr[@]} -gt 0 ]] && docker_json="[$(IFS=','; echo "${arr[*]}")]"
+    _log "Docker containers: ${#arr[@]}"
+  fi
+
+  # tmux sessions
+  local tmux_json="[]"
+  if _tmux_ok; then
+    local tarr=()
+    while IFS= read -r sess; do
+      [[ -z "$sess" ]] && continue
+      tarr+=("\"$sess\"")
+    done < <(tmux list-sessions -F '#{session_name}' 2>/dev/null || true)
+    [[ ${#tarr[@]} -gt 0 ]] && tmux_json="[$(IFS=','; echo "${tarr[*]}")]"
+    _log "tmux sessions: ${#tarr[@]}"
+  fi
+
+  printf '{\n  "saved_at": "%s",\n  "systemd_services": %s,\n  "docker_containers": %s,\n  "tmux_sessions": %s\n}\n' \
+    "$(date '+%Y-%m-%d %H:%M:%S')" "$svc_json" "$docker_json" "$tmux_json" > "$SNAPSHOT_FILE"
+
+  _log "Saved: ${#svcs[@]} systemd, Docker, tmux → $SNAPSHOT_FILE"
+}
+
+cmd_restore() {
+  if [[ ! -f "$SNAPSHOT_FILE" ]]; then
+    _log "Snapshot nahi mila: $SNAPSHOT_FILE — pehle 'save' chalao" ERROR
+    exit 1
+  fi
+
+  local saved_at
+  saved_at=$(python3 -c "import json; print(json.load(open('$SNAPSHOT_FILE'))['saved_at'])" 2>/dev/null || echo "?")
+  _log "Restore from snapshot ($saved_at)"
+
+  local ok=0 fail=0 skip=0
+
+  # systemd
+  while IFS= read -r svc; do
+    [[ -z "$svc" ]] && continue
+    if ! systemctl list-unit-files "$svc" &>/dev/null; then
+      _log "Not found: $svc" WARN; ((skip++)) || true; continue
+    fi
+    if [[ "$(systemctl is-active "$svc" 2>/dev/null || true)" == "active" ]]; then
+      ((skip++)) || true; continue
+    fi
+    if systemctl start "$svc" 2>/dev/null; then
+      _log "Started: $svc"; ((ok++)) || true
+    else
+      _log "Failed:  $svc" ERROR; ((fail++)) || true
+    fi
+  done < <(python3 -c "
+import json
+for s in json.load(open('$SNAPSHOT_FILE')).get('systemd_services', []):
+    print(s['name'])
+" 2>/dev/null)
+
+  # Docker
+  if _docker_ok; then
+    while IFS= read -r c; do
+      [[ -z "$c" ]] && continue
+      local state; state=$(docker inspect --format '{{.State.Status}}' "$c" 2>/dev/null || echo "not_found")
+      if [[ "$state" == "running" ]]; then ((skip++)) || true; continue; fi
+      if [[ "$state" == "not_found" ]]; then
+        _log "Docker not found: $c" WARN; ((skip++)) || true; continue
+      fi
+      if docker start "$c" &>/dev/null; then
+        _log "Docker started: $c"; ((ok++)) || true
+      else
+        _log "Docker failed:  $c" ERROR; ((fail++)) || true
+      fi
+    done < <(python3 -c "
+import json
+for c in json.load(open('$SNAPSHOT_FILE')).get('docker_containers', []):
+    print(c['name'])
+" 2>/dev/null)
+  fi
+
+  # tmux sessions — recipe file se restart karo
+  if _tmux_ok; then
+    while IFS= read -r sess; do
+      [[ -z "$sess" ]] && continue
+      if tmux has-session -t "$sess" 2>/dev/null; then
+        ((skip++)) || true; continue
+      fi
+      local recipe="$RECIPES_DIR/${sess}.sh"
+      if [[ -f "$recipe" ]]; then
+        if sudo -u ubuntu tmux new-session -d -s "$sess" "bash '$recipe'" 2>/dev/null; then
+          _log "tmux started: $sess (recipe: $recipe)"; ((ok++)) || true
+        else
+          _log "tmux failed:  $sess" ERROR; ((fail++)) || true
+        fi
+      else
+        _log "tmux '$sess' — recipe nahi mila ($recipe), manually start karo" WARN
+        ((skip++)) || true
+      fi
+    done < <(python3 -c "
+import json
+for s in json.load(open('$SNAPSHOT_FILE')).get('tmux_sessions', []):
+    print(s)
+" 2>/dev/null)
+  fi
+
+  _log "Restore done — started:$ok  skipped:$skip  failed:$fail"
+}
+
+cmd_status() {
+  if [[ ! -f "$SNAPSHOT_FILE" ]]; then
+    echo "No snapshot found. Run: sudo service-manager.sh save"
+    return
+  fi
+  python3 - <<'PY'
+import json, subprocess
+
+SNAPSHOT  = '/var/lib/service-manager/running-services.json'
+RECIPES   = '/home/ubuntu/.ai-ide/services'
+d = json.load(open(SNAPSHOT))
+
+tmux_count = len(d.get('tmux_sessions', []))
+print(f"\nSnapshot : {d['saved_at']}")
+print(f"Systemd  : {len(d['systemd_services'])}  |  Docker: {len(d['docker_containers'])}  |  tmux: {tmux_count}\n")
+
+print("=== Systemd Services ===")
+for s in d['systemd_services']:
+    r = subprocess.run(['systemctl', 'is-active', s['name']], capture_output=True, text=True)
+    icon = '[OK]' if r.stdout.strip() == 'active' else '[--]'
+    print(f"  {icon} {s['name']}")
+
+if d['docker_containers']:
+    print("\n=== Docker Containers ===")
+    for c in d['docker_containers']:
+        r = subprocess.run(['docker', 'inspect', '--format', '{{.State.Status}}', c['name']],
+                           capture_output=True, text=True)
+        state = r.stdout.strip() or 'not_found'
+        icon = '[OK]' if state == 'running' else '[--]'
+        print(f"  {icon} {c['name']} ({c['image']}) — {state}")
+
+if d.get('tmux_sessions'):
+    print("\n=== tmux Sessions ===")
+    r = subprocess.run(['tmux', 'list-sessions', '-F', '#{session_name}'],
+                       capture_output=True, text=True)
+    running = set(r.stdout.strip().splitlines())
+    import os
+    for sess in d['tmux_sessions']:
+        icon = '[OK]' if sess in running else '[--]'
+        recipe = f"{RECIPES}/{sess}.sh"
+        has_recipe = '(recipe ok)' if os.path.exists(recipe) else '(no recipe — manual restart needed)'
+        print(f"  {icon} {sess} {has_recipe}")
+print()
+PY
+}
+
+case "${1:-}" in
+  save)    cmd_save ;;
+  restore) cmd_restore ;;
+  status)  cmd_status ;;
+  *)
+    echo "Usage: sudo $0 {save|restore|status}"
+    echo "  save     — running services ka snapshot lo (systemd + Docker + tmux)"
+    echo "  restore  — snapshot se services wapas start karo"
+    echo "  status   — snapshot vs current state compare karo"
+    exit 1
+    ;;
+esac
+SVC_EOF
+chmod 755 /usr/local/bin/service-manager.sh
+ok "service-manager.sh installed at /usr/local/bin/"
+
+log "APT hooks install ho rahe hain (pre-invoke: save, post-invoke: restore)"
+# DPkg::Pre-Invoke  fires before dpkg processes any package — captures the
+# running-services list while everything is still up.
+# DPkg::Post-Invoke fires after dpkg finishes — restores anything that got
+# stopped during the upgrade without needing a reboot.
+cat > /etc/apt/apt.conf.d/80-service-snapshot <<'APT_EOF'
+DPkg::Pre-Invoke  { "[ -x /usr/local/bin/service-manager.sh ] && /usr/local/bin/service-manager.sh save    2>/dev/null || true"; };
+DPkg::Post-Invoke { "[ -x /usr/local/bin/service-manager.sh ] && /usr/local/bin/service-manager.sh restore 2>/dev/null || true"; };
+APT_EOF
+ok "APT hooks → /etc/apt/apt.conf.d/80-service-snapshot"
+
+log "Installing systemd restore-on-boot service"
+cat > /etc/systemd/system/service-manager-restore.service <<'UNIT_EOF'
+[Unit]
+Description=Restore services from pre-update snapshot (service-manager)
+After=network.target docker.service
+Wants=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/service-manager.sh restore
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+UNIT_EOF
+
+systemctl daemon-reload
+systemctl enable service-manager-restore.service
+ok "service-manager-restore.service enabled (boot pe auto-restore)"
+
+# Initial snapshot — captures the services registered in steps above so the
+# very first `apt upgrade` has a reference point to restore from.
+log "Initial snapshot le raha hai..."
+/usr/local/bin/service-manager.sh save
+ok "Initial snapshot → /var/lib/service-manager/running-services.json"
+
+done_step "Step 9.5 — Auto service-snapshot + restore"
+
+# ────────────────────────────────────────────────────────────────────
 # Make sure .claude/skills dir exists for future skill installs
 # ────────────────────────────────────────────────────────────────────
 
