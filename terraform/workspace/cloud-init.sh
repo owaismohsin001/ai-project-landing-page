@@ -1250,6 +1250,217 @@ ok "Initial snapshot → /var/lib/service-manager/running-services.json"
 done_step "Step 9.5 — Auto service-snapshot + restore"
 
 # ────────────────────────────────────────────────────────────────────
+# Step 9.6 — Service watchdog (polls every Traefik-registered service)
+# ────────────────────────────────────────────────────────────────────
+#
+# The healthcheck timers from Step 7 cover backend + frontend only. This
+# watchdog is the catch-all: it pulls the per-user Traefik config from
+# the central proxy router on every probe round, so every service the
+# user has registered via `register_service` (in addition to the
+# defaults: frontend, api, ide, docs, sheets, docs-agent, sheets-agent)
+# is monitored automatically. Three consecutive probe failures → restart
+# the underlying systemd unit / docker container / tmux recipe. Five
+# failed restart cycles in a row → set a "give up" flag so we don't
+# restart-storm a permanently broken service.
+
+hdr "Step 9.6 — Service watchdog (probes every Traefik-registered service)"
+
+log "Installing /usr/local/bin/ai-ide-watchdog.sh"
+cat > /usr/local/bin/ai-ide-watchdog.sh <<'WATCHDOG_EOF'
+#!/usr/bin/env bash
+# Watchdog for every service Traefik routes to in this workspace.
+#
+# Source of truth: the central proxy router's /api/traefik/user/$USER_ID,
+# polled each round so newly-registered services are picked up
+# automatically.
+#
+# Probe: curl http://127.0.0.1:<port>/. -f is intentionally omitted: any
+# HTTP response (200/302/404/5xx) means the process is alive and
+# listening; only connect-refused / timeout counts as a failure.
+#
+# Cadence: 30s probe interval. 3 fails → restart. 5 failed restart cycles
+# → "give up" (keep monitoring, stop restarting).
+
+set -uo pipefail
+
+if [ -f /etc/workspace.env ]; then
+  set -a
+  # shellcheck disable=SC1091
+  . /etc/workspace.env
+  set +a
+fi
+
+PROXY_ROUTER_URL="${PROXY_ROUTER_URL:-}"
+USER_ID="${USER_ID:-}"
+if [ -z "$PROXY_ROUTER_URL" ] || [ -z "$USER_ID" ]; then
+  echo "[ai-ide-watchdog] PROXY_ROUTER_URL or USER_ID missing from /etc/workspace.env — exiting" >&2
+  exit 1
+fi
+
+readonly PROXY_ROUTER_URL USER_ID
+readonly TARGET_USER="${TARGET_USER:-ubuntu}"
+readonly TARGET_HOME="/home/${TARGET_USER}"
+readonly RECIPES_DIR="${TARGET_HOME}/.ai-ide/services"
+
+readonly PROBE_INTERVAL=30
+readonly FAIL_THRESHOLD=3
+readonly MAX_RESTART_ATTEMPTS=5
+readonly PROBE_TIMEOUT=5
+readonly INITIAL_GRACE=60
+
+declare -A RESTARTERS=(
+  ["frontend"]="systemctl restart ai-ide-frontend"
+  ["api"]="systemctl restart ai-ide-backend"
+  ["ide"]="systemctl restart code-server@${TARGET_USER}"
+  ["docs"]="docker restart ai-ide-onlyoffice-docs"
+  ["sheets"]="docker restart ai-ide-onlyoffice-sheets"
+  ["docs-agent"]="systemctl restart ai-ide-docs-agent"
+  ["sheets-agent"]="systemctl restart ai-ide-sheets-agent"
+)
+
+declare -A FAILS RESTARTS GIVE_UP IGNORED
+
+ts()    { date -u +%FT%TZ; }
+slog()  { echo "[ai-ide-watchdog $(ts)] $*"; }
+swarn() { echo "[ai-ide-watchdog $(ts)] WARN $*" >&2; }
+
+has_restart_strategy() {
+  local name="$1"
+  [ -n "${RESTARTERS[$name]:-}" ] && return 0
+  [ -f "${RECIPES_DIR}/${name}.sh" ] && return 0
+  return 1
+}
+
+fetch_services() {
+  local body
+  body=$(curl -sf --max-time 10 \
+    "${PROXY_ROUTER_URL%/}/api/traefik/user/${USER_ID}" 2>/dev/null) || return 0
+  printf '%s' "$body" | python3 -c '
+import json, sys
+try:
+    cfg = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+services = (cfg.get("http") or {}).get("services") or {}
+for name, svc in services.items():
+    url = (((svc.get("loadBalancer") or {}).get("servers") or [{}])[0]
+           .get("url") or "")
+    tail = url.rsplit(":", 1)[-1].split("/", 1)[0]
+    if tail.isdigit():
+        print(f"{name}\t{tail}")
+'
+}
+
+probe() {
+  local port="$1"
+  curl -sS --max-time "$PROBE_TIMEOUT" -o /dev/null \
+    "http://127.0.0.1:${port}/" 2>/dev/null
+}
+
+restart_service() {
+  local name="$1"
+  local cmd="${RESTARTERS[$name]:-}"
+
+  if [ -n "$cmd" ]; then
+    slog "restart: ${name} → ${cmd}"
+    eval "$cmd"
+    return $?
+  fi
+
+  local recipe="${RECIPES_DIR}/${name}.sh"
+  if [ -f "$recipe" ]; then
+    slog "restart: ${name} → tmux recipe ${recipe}"
+    sudo -u "$TARGET_USER" tmux kill-session -t "$name" 2>/dev/null || true
+    sudo -u "$TARGET_USER" tmux new -d -s "$name" "bash '$recipe'"
+    return $?
+  fi
+
+  swarn "no restart strategy for '${name}' (no RESTARTERS entry, no ${name}.sh recipe)"
+  return 1
+}
+
+slog "starting (interval=${PROBE_INTERVAL}s, threshold=${FAIL_THRESHOLD}, max_restarts=${MAX_RESTART_ATTEMPTS})"
+slog "router=${PROXY_ROUTER_URL%/}  user_id=${USER_ID}"
+
+sleep "$INITIAL_GRACE"
+
+while :; do
+  while IFS=$'\t' read -r name port; do
+    [ -z "${name:-}" ] && continue
+
+    # Services with no way to restart (registered for an externally-managed
+    # process the user hasn't backed with a tmux recipe) are noise. Warn
+    # once, then skip on every subsequent round.
+    if ! has_restart_strategy "$name"; then
+      if [ "${IGNORED[$name]:-0}" = "0" ]; then
+        swarn "skipping '${name}:${port}' — no RESTARTERS entry, no ${RECIPES_DIR}/${name}.sh. Add a recipe to enable auto-restart."
+        IGNORED[$name]=1
+      fi
+      continue
+    fi
+
+    if probe "$port"; then
+      if [ "${GIVE_UP[$name]:-0}" = "1" ]; then
+        slog "recovered: ${name}:${port} responding again — clearing give-up flag"
+      fi
+      FAILS[$name]=0
+      RESTARTS[$name]=0
+      GIVE_UP[$name]=0
+      continue
+    fi
+
+    FAILS[$name]=$(( ${FAILS[$name]:-0} + 1 ))
+    slog "probe fail #${FAILS[$name]} on ${name}:${port}"
+
+    if [ "${GIVE_UP[$name]:-0}" = "1" ]; then
+      continue
+    fi
+
+    if [ "${FAILS[$name]}" -ge "$FAIL_THRESHOLD" ]; then
+      RESTARTS[$name]=$(( ${RESTARTS[$name]:-0} + 1 ))
+      slog "${name}:${port} failed ${FAILS[$name]} probes — restart attempt #${RESTARTS[$name]}/${MAX_RESTART_ATTEMPTS}"
+      restart_service "$name" || swarn "restart command for ${name} returned non-zero"
+      FAILS[$name]=0
+
+      if [ "${RESTARTS[$name]}" -ge "$MAX_RESTART_ATTEMPTS" ]; then
+        swarn "giving up on ${name}:${port} after ${RESTARTS[$name]} restart attempts — keeps monitoring but no further restarts until it recovers on its own"
+        GIVE_UP[$name]=1
+      fi
+    fi
+  done < <(fetch_services)
+
+  sleep "$PROBE_INTERVAL"
+done
+WATCHDOG_EOF
+chmod 755 /usr/local/bin/ai-ide-watchdog.sh
+
+log "Installing /etc/systemd/system/ai-ide-watchdog.service"
+cat > /etc/systemd/system/ai-ide-watchdog.service <<EOF
+[Unit]
+Description=AI-IDE watchdog (probes Traefik-registered services, restarts dead ones)
+After=network-online.target ai-ide-backend.service ai-ide-frontend.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/workspace.env
+ExecStart=/usr/local/bin/ai-ide-watchdog.sh
+Restart=always
+RestartSec=10
+StartLimitIntervalSec=0
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now ai-ide-watchdog.service 2>&1 | indent
+ok "Watchdog enabled — tail with 'journalctl -u ai-ide-watchdog -f'"
+done_step "Step 9.6 — Service watchdog"
+
+# ────────────────────────────────────────────────────────────────────
 # Make sure .claude/skills dir exists for future skill installs
 # ────────────────────────────────────────────────────────────────────
 
