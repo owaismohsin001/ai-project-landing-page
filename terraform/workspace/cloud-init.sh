@@ -1268,18 +1268,35 @@ hdr "Step 9.6 — Service watchdog (probes every Traefik-registered service)"
 log "Installing /usr/local/bin/ai-ide-watchdog.sh"
 cat > /usr/local/bin/ai-ide-watchdog.sh <<'WATCHDOG_EOF'
 #!/usr/bin/env bash
+# /usr/local/bin/ai-ide-watchdog.sh
+#
 # Watchdog for every service Traefik routes to in this workspace.
 #
-# Source of truth: the central proxy router's /api/traefik/user/$USER_ID,
-# polled each round so newly-registered services are picked up
-# automatically.
+# Source of truth for the service list: the central proxy router's
+# /api/traefik/user/$USER_ID, polled each round so newly-registered
+# services are picked up automatically.
+#
+# Restart strategy per service is auto-discovered on first sight and
+# cached in /var/lib/ai-ide/restarters (key=value lines). Discovery
+# priority:
+#   1. ~/.ai-ide/services/<name>.sh recipe (cached as "RECIPE")
+#   2. <name>.service systemd unit (cached as "systemctl restart <name>")
+#   3. Docker container named <name>  (cached as "docker restart <name>")
+#   4. Nothing → cached as empty string; service is skipped silently.
+#
+# The cache file is human-editable: change a value to override a wrong
+# guess, delete a line to re-trigger discovery on the next round. A few
+# defaults (frontend / api / ide / docs / sheets / docs-agent /
+# sheets-agent) are hard-coded in this script so the cache file isn't
+# needed to bootstrap.
 #
 # Probe: curl http://127.0.0.1:<port>/. -f is intentionally omitted: any
-# HTTP response (200/302/404/5xx) means the process is alive and
-# listening; only connect-refused / timeout counts as a failure.
+# HTTP response (200/302/404/5xx) means the process is alive; only
+# connect-refused / timeout counts as a failure.
 #
-# Cadence: 30s probe interval. 3 fails → restart. 5 failed restart cycles
-# → "give up" (keep monitoring, stop restarting).
+# Cadence: 60s initial grace, 30s probe interval. 3 consecutive failures
+# → restart. 5 failed restart cycles in a row → "give up" flag (keep
+# monitoring so a manual recovery is detected, but stop restarting).
 
 set -uo pipefail
 
@@ -1301,12 +1318,15 @@ readonly PROXY_ROUTER_URL USER_ID
 readonly TARGET_USER="${TARGET_USER:-ubuntu}"
 readonly TARGET_HOME="/home/${TARGET_USER}"
 readonly RECIPES_DIR="${TARGET_HOME}/.ai-ide/services"
+readonly CACHE_DIR="/var/lib/ai-ide"
+readonly CACHE_FILE="${CACHE_DIR}/restarters"
 
 readonly PROBE_INTERVAL=30
 readonly FAIL_THRESHOLD=3
 readonly MAX_RESTART_ATTEMPTS=5
 readonly PROBE_TIMEOUT=5
 readonly INITIAL_GRACE=60
+readonly DISCOVER_TIMEOUT=3
 
 declare -A RESTARTERS=(
   ["frontend"]="systemctl restart ai-ide-frontend"
@@ -1324,13 +1344,79 @@ ts()    { date -u +%FT%TZ; }
 slog()  { echo "[ai-ide-watchdog $(ts)] $*"; }
 swarn() { echo "[ai-ide-watchdog $(ts)] WARN $*" >&2; }
 
-has_restart_strategy() {
+# ── cache I/O ───────────────────────────────────────────────────────
+load_cache() {
+  [ -f "$CACHE_FILE" ] || return 0
+  local key val
+  while IFS='=' read -r key val; do
+    [[ -z "${key:-}" ]] && continue
+    [[ "$key" =~ ^[[:space:]]*# ]] && continue
+    RESTARTERS[$key]="$val"
+  done < "$CACHE_FILE"
+}
+
+persist_cache() {
+  load_cache  # Merge any manual edits before rewriting.
+  mkdir -p "$CACHE_DIR"
+  local tmp
+  tmp=$(mktemp -p "$CACHE_DIR" .restarters.XXXXXX) || return 1
+  {
+    echo "# ai-ide watchdog restart strategies — auto-discovered + manual overrides."
+    echo "# Format: <service_name>=<restart_command>"
+    echo "# Special: RECIPE  = restart via ${RECIPES_DIR}/<name>.sh in tmux."
+    echo "#         <empty>  = no strategy found; service is monitored but not restarted."
+    echo "#"
+    echo "# Edit to override a wrong guess. Delete a line to re-trigger"
+    echo "# discovery on the next round."
+    echo "#"
+    local k
+    for k in $(printf '%s\n' "${!RESTARTERS[@]}" | sort); do
+      printf '%s=%s\n' "$k" "${RESTARTERS[$k]}"
+    done
+  } > "$tmp" && mv "$tmp" "$CACHE_FILE"
+}
+
+# ── discovery ───────────────────────────────────────────────────────
+discover_restarter() {
   local name="$1"
-  [ -n "${RESTARTERS[$name]:-}" ] && return 0
-  [ -f "${RECIPES_DIR}/${name}.sh" ] && return 0
+
+  if [ -f "${RECIPES_DIR}/${name}.sh" ]; then
+    echo "RECIPE"; return 0
+  fi
+
+  if timeout "$DISCOVER_TIMEOUT" systemctl cat "${name}.service" >/dev/null 2>&1; then
+    echo "systemctl restart ${name}"; return 0
+  fi
+
+  if timeout "$DISCOVER_TIMEOUT" docker ps -a --format '{{.Names}}' 2>/dev/null \
+       | grep -qFx "$name"; then
+    echo "docker restart ${name}"; return 0
+  fi
+
   return 1
 }
 
+# Make sure RESTARTERS has an entry for $name (empty allowed = known
+# unmappable). Returns 0 if a usable strategy is on file, 1 otherwise.
+ensure_strategy() {
+  local name="$1"
+  if [ -n "${RESTARTERS[$name]+x}" ]; then
+    [ -n "${RESTARTERS[$name]}" ] && return 0 || return 1
+  fi
+
+  local cmd
+  if cmd=$(discover_restarter "$name"); then
+    RESTARTERS[$name]="$cmd"
+    slog "learned: ${name} → ${cmd}"
+  else
+    RESTARTERS[$name]=""
+    swarn "no restart strategy for '${name}' — looked for ${RECIPES_DIR}/${name}.sh, ${name}.service, docker container '${name}'"
+  fi
+  persist_cache
+  [ -n "${RESTARTERS[$name]}" ]
+}
+
+# ── service ops ─────────────────────────────────────────────────────
 fetch_services() {
   local body
   body=$(curl -sf --max-time 10 \
@@ -1361,26 +1447,37 @@ restart_service() {
   local name="$1"
   local cmd="${RESTARTERS[$name]:-}"
 
-  if [ -n "$cmd" ]; then
-    slog "restart: ${name} → ${cmd}"
-    eval "$cmd"
-    return $?
-  fi
-
-  local recipe="${RECIPES_DIR}/${name}.sh"
-  if [ -f "$recipe" ]; then
+  if [ "$cmd" = "RECIPE" ]; then
+    local recipe="${RECIPES_DIR}/${name}.sh"
+    if [ ! -f "$recipe" ]; then
+      swarn "recipe for ${name} disappeared (${recipe}) — clearing strategy"
+      RESTARTERS[$name]=""
+      persist_cache
+      return 1
+    fi
     slog "restart: ${name} → tmux recipe ${recipe}"
     sudo -u "$TARGET_USER" tmux kill-session -t "$name" 2>/dev/null || true
     sudo -u "$TARGET_USER" tmux new -d -s "$name" "bash '$recipe'"
     return $?
   fi
 
-  swarn "no restart strategy for '${name}' (no RESTARTERS entry, no ${name}.sh recipe)"
+  if [ -n "$cmd" ]; then
+    slog "restart: ${name} → ${cmd}"
+    eval "$cmd"
+    return $?
+  fi
+
   return 1
 }
 
+# ── main ────────────────────────────────────────────────────────────
+load_cache
 slog "starting (interval=${PROBE_INTERVAL}s, threshold=${FAIL_THRESHOLD}, max_restarts=${MAX_RESTART_ATTEMPTS})"
-slog "router=${PROXY_ROUTER_URL%/}  user_id=${USER_ID}"
+slog "router=${PROXY_ROUTER_URL%/}  user_id=${USER_ID}  cache=${CACHE_FILE}"
+
+# Persist once at startup so the defaults land in the cache file even
+# if discovery never runs (makes the file a complete view).
+persist_cache
 
 sleep "$INITIAL_GRACE"
 
@@ -1388,16 +1485,16 @@ while :; do
   while IFS=$'\t' read -r name port; do
     [ -z "${name:-}" ] && continue
 
-    # Services with no way to restart (registered for an externally-managed
-    # process the user hasn't backed with a tmux recipe) are noise. Warn
-    # once, then skip on every subsequent round.
-    if ! has_restart_strategy "$name"; then
+    if ! ensure_strategy "$name"; then
       if [ "${IGNORED[$name]:-0}" = "0" ]; then
-        swarn "skipping '${name}:${port}' — no RESTARTERS entry, no ${RECIPES_DIR}/${name}.sh. Add a recipe to enable auto-restart."
+        swarn "skipping '${name}:${port}' — drop a ${RECIPES_DIR}/${name}.sh recipe, install a ${name}.service unit, or run a docker container named '${name}' to enable auto-restart"
         IGNORED[$name]=1
       fi
       continue
     fi
+
+    # A real strategy exists → re-probing is meaningful.
+    IGNORED[$name]=0
 
     if probe "$port"; then
       if [ "${GIVE_UP[$name]:-0}" = "1" ]; then
