@@ -222,6 +222,19 @@ else
   npm install -g @anthropic-ai/claude-code 2>&1 | indent
 fi
 
+# The claude.exe wrapper does a one-time per-user binary extract on its very
+# first invocation (~30s). The backend's CLI detection in
+# src/utils/claudeCli.ts validates candidates with `claude --version` under a
+# 5s timeout — so on a cold boot, before TARGET_USER has ever run claude, the
+# wrapper's extraction blows past 5s and the backend logs
+# "None of the candidate Claude CLI paths worked" → chat features stay dead
+# until something warms it manually. Run once as TARGET_USER here so the cache
+# at ~${TARGET_USER}/.cache/claude-cli-nodejs is populated before
+# ai-ide-backend.service starts in Step 7.
+log "Warming claude wrapper for ${TARGET_USER} (one-time ~30s extract)"
+as_user timeout 90 /usr/bin/claude --version 2>&1 | indent \
+  || warn "claude warm-up didn't finish in 90s (non-fatal; backend may log 'not detected' on first boot)"
+
 ok "claude $(claude --version 2>/dev/null | head -1 || echo unknown)"
 done_step "Step 3 / 9 — Claude Code CLI"
 
