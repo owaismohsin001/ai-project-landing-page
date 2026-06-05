@@ -1,13 +1,24 @@
 "use client";
 
-import { useState } from "react";
+import { Suspense, useState } from "react";
 import Link from "next/link";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import { AuthLayout } from "@/components/AuthLayout";
 import { Alert, fieldClass, labelClass, primaryButtonClass } from "@/components/ui";
 
 export default function LoginPage() {
+  // useSearchParams forces a client render; Next.js 15 requires it to sit
+  // under a Suspense boundary or the route opts out of static prerender.
+  return (
+    <Suspense fallback={null}>
+      <LoginForm />
+    </Suspense>
+  );
+}
+
+function LoginForm() {
   const router = useRouter();
+  const searchParams = useSearchParams();
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
@@ -25,7 +36,12 @@ export default function LoginPage() {
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "Could not sign you in.");
-      router.push("/dashboard");
+      // Only honor in-app paths so an attacker can't craft
+      // /login?returnTo=https://evil.example.com to phish a redirect.
+      const raw = searchParams.get("returnTo");
+      const next =
+        raw && raw.startsWith("/") && !raw.startsWith("//") ? raw : "/dashboard";
+      router.push(next);
       router.refresh();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not sign you in.");
