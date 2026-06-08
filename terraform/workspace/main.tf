@@ -12,22 +12,10 @@ locals {
   }
 }
 
-# Newest Ubuntu 24.04 LTS (Noble) x86_64 AMI in the region.
-# cloud-init.sh is apt-based and targets the 'ubuntu' user.
-data "aws_ami" "ubuntu" {
-  most_recent = true
-  owners      = ["099720109477"] # Canonical
-
-  filter {
-    name   = "name"
-    values = ["ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-*"]
-  }
-
-  filter {
-    name   = "virtualization-type"
-    values = ["hvm"]
-  }
-}
+# Workspace AMI is now a pre-baked image (bake.sh + snapshot). Pinned
+# explicitly via var.workspace_ami_id so a wrong stock Ubuntu AMI can
+# never accidentally provision an unbaked instance — provision.sh hard-
+# fails if /etc/ai-ide-ami-version is missing.
 
 # ─── S3 bucket ────────────────────────────────────────────────────────
 resource "aws_s3_bucket" "workspace" {
@@ -125,7 +113,7 @@ locals {
 }
 
 resource "aws_instance" "workspace" {
-  ami                         = data.aws_ami.ubuntu.id
+  ami                         = var.workspace_ami_id
   instance_type               = var.instance_type
   vpc_security_group_ids      = [aws_security_group.workspace.id]
   associate_public_ip_address = true

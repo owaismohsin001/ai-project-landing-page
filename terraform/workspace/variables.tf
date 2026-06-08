@@ -19,17 +19,27 @@ variable "instance_type" {
   type        = string
 }
 
-variable "volume_size" {
-  description = "Root EBS volume size in GiB — sized by membership plan. Defaults to 20; lib/workspace.ts overrides per plan (e.g. Pro → 40)."
-  type        = number
-  default     = 20
+variable "workspace_ami_id" {
+  description = "Pre-baked workspace AMI id (built by bake.sh + `aws ec2 create-image`). Every new instance launches from this and is finalized by provision.sh — there is no fallback to a stock Ubuntu AMI on purpose, because provision.sh assumes everything bake.sh installs is already present."
+  type        = string
 
   validation {
-    # AMI's snapshot is ~8 GiB; cloud-init pulls Docker + Playwright +
-    # ONLYOFFICE images on top, which puts a realistic floor around 16.
-    # 200 GiB cap stops a typo from accidentally provisioning a huge disk.
-    condition     = var.volume_size >= 16 && var.volume_size <= 200
-    error_message = "volume_size must be between 16 and 200 GiB."
+    condition     = can(regex("^ami-[0-9a-f]{8,17}$", var.workspace_ami_id))
+    error_message = "workspace_ami_id must look like ami-xxxxxxxx (8-17 lowercase hex)."
+  }
+}
+
+variable "volume_size" {
+  description = "Root EBS volume size in GiB — sized by membership plan. Defaults to 40 (the workspace AMI's snapshot size); lib/workspace.ts can scale up per plan."
+  type        = number
+  default     = 40
+
+  validation {
+    # The pre-baked workspace AMI's root snapshot is 40 GiB; AWS will not
+    # let an instance launch with volume_size < snapshot_size. 200 GiB cap
+    # stops a typo from accidentally provisioning a huge disk.
+    condition     = var.volume_size >= 40 && var.volume_size <= 200
+    error_message = "volume_size must be between 40 and 200 GiB (40 is the workspace AMI's snapshot size)."
   }
 }
 

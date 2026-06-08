@@ -26,15 +26,14 @@ export const PLAN_INSTANCE_TYPES: Record<PlanId, string> = {
 };
 
 /**
- * Root EBS volume size in GiB per plan. Pro and premium default to 40
- * GiB because the workspace pulls multi-GB Docker images at cloud-init
- * time (Playwright ~1.6 GB, two ONLYOFFICE Docs containers ~1.4 GB
- * combined) on top of node_modules + code-server + apt packages —
- * 20 GiB leaves very little headroom. Starter stays at 20 to keep the
- * starter price point.
+ * Root EBS volume size in GiB per plan. All plans use 40 GiB because the
+ * pre-baked workspace AMI's snapshot is 40 GiB — AWS rejects launches
+ * with volume_size < snapshot_size. (Pre-AMI, starter could fit in 20
+ * because cloud-init.sh installed everything from scratch onto a thin
+ * Ubuntu root; provision.sh inherits the AMI's footprint instead.)
  */
 export const PLAN_VOLUME_SIZES: Record<PlanId, number> = {
-  starter: 20,
+  starter: 40,
   pro: 40,
   premium: 40,
 };
@@ -344,6 +343,17 @@ export async function provisionWorkspace(
     throw new Error(`No volume size mapped for plan "${input.plan}".`);
   }
 
+  // Pre-baked workspace AMI. provision.sh hard-fails if the AMI isn't a
+  // baked one (no /etc/ai-ide-ami-version), so we refuse to provision
+  // when WORKSPACE_AMI_ID isn't set rather than silently fall back to a
+  // stock Ubuntu image that would brick the EC2 mid-boot.
+  const workspaceAmiId = process.env.WORKSPACE_AMI_ID;
+  if (!workspaceAmiId || !/^ami-[0-9a-f]{8,17}$/.test(workspaceAmiId)) {
+    throw new Error(
+      "WORKSPACE_AMI_ID is not set (or not an ami-xxxxxxxx id). Bake a workspace AMI with terraform/workspace/bake.sh and put its id in the platform env."
+    );
+  }
+
   // Wrap the optional callback so the rest of this function can call it
   // unconditionally + swallow any error from a slow DB write (we never
   // want a progress-tracking failure to abort actual provisioning).
@@ -376,6 +386,7 @@ export async function provisionWorkspace(
     user_id: input.userId,
     instance_type: instanceType,
     volume_size: volumeSize,
+    workspace_ami_id: workspaceAmiId,
     platform_domain: PLATFORM_DOMAIN,
     platform_protocol: PLATFORM_PROTOCOL,
     backend_config_url: `${TRAEFIK_ROUTER_BASE_URL.replace(/\/+$/, "")}/${input.userId}`,

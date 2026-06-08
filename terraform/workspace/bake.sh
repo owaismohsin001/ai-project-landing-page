@@ -1,27 +1,38 @@
 #!/usr/bin/env bash
 #
-# AI-IDE Studio — EC2 cloud-init startup script
+# AI-IDE Studio — workspace AMI bake script
 #
-# This script is designed to run as **root** on a fresh Ubuntu 22.04/24.04
-# EC2 instance via cloud-init (user-data). It's fully non-interactive —
-# no prompts, no `read` calls, no human input required.
+# Run this ONCE on a fresh Ubuntu 24.04 EC2 (or on an existing workspace
+# you want to re-bake) AS ROOT. It installs every piece of infrastructure
+# that's identical across users — apt deps, Node, Claude CLI, code-server,
+# Docker, Playwright + ONLYOFFICE images, the AI-IDE backend/frontend
+# repos, and every systemd unit — so a snapshot of the result becomes
+# the "workspace AMI" that the terraform module spins up for each new
+# subscriber.
 #
-# What it does:
+# Per-instance setup (USER_ID, AWS keys, OFFICE_JWT_SECRET, latest repo
+# pulls, fresh ~/.claude/CLAUDE.md) is NOT done here — that lives in
+# provision.sh which user-data.sh.tftpl fetches + runs on every new
+# instance launched from the AMI.
+#
+# What this script DOES (rolls into the AMI):
 #   1. apt base packages + Node.js 20 LTS + Claude Code CLI + code-server
-#   2. Clones backend (AIWorkspaceBackEnd) + frontend (AIWorkspaceFrontEnd)
-#      into /home/ubuntu/AI-IDE/{backend,frontend}
-#   3. npm install in both projects (as the ubuntu user)
-#   4. Configures code-server to bind 0.0.0.0:8080 with auth disabled
-#   5. Creates systemd services for backend + frontend + code-server so
-#      everything auto-starts on boot
-#   6. Installs Docker Engine + runs a Playwright (+ Chromium) container
-#      named 'ai-ide-playwright' for tests / AI-driven browser automation
+#   2. Clones backend + frontend into /home/ubuntu/AI-IDE/* + npm install
+#   3. Configures code-server (bind 0.0.0.0:8080, auth=none) + writes the
+#      user-level settings.json (hide welcome / menu bar / etc.)
+#   4. Installs systemd units that read identity from /etc/workspace.env
+#      so they don't bake the source workspace's identity into the AMI
+#   5. Docker Engine + the ai-ide-playwright container
+#   6. ONLYOFFICE docs/sheets containers + their docs-agent / sheets-agent
+#      sidecars
+#   7. tmux recipe boot-restoration + service-manager snapshot hooks +
+#      Traefik-aware watchdog
 #
-# Usage (paste into EC2 user-data field at instance launch):
-#   #!/bin/bash
-#   curl -fsSL https://raw.githubusercontent.com/techLover1122/-AIWorkspaceBackEnd/main/scripts/cloud-init.sh | bash
-#
-# Or upload directly as the user-data script.
+# Usage (creating the AMI):
+#   sudo /opt/cloud-init/bake.sh
+#   # then, off-box:
+#   aws ec2 stop-instances --instance-ids <id> --profile phase1-deploy
+#   aws ec2 create-image  --instance-id  <id> --name ai-workspace-YYYYMMDD …
 #
 # Required EC2 Security Group inbound rules (TCP):
 #   - 22    (SSH)
@@ -364,6 +375,10 @@ cat > /etc/systemd/system/ai-ide-backend.service <<EOF
 [Unit]
 Description=AI-IDE Backend (Hono API on :${BACKEND_PORT})
 After=network.target
+# StartLimitIntervalSec lives in [Unit] in modern systemd — putting it in
+# [Service] makes systemd log "Unknown key name" and silently fall back to
+# the default rate-limit (5 restarts / 10s → unit goes "failed").
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -384,13 +399,12 @@ Environment=PORT=${BACKEND_PORT}
 # run \`npm run dev\` manually in a terminal.
 ExecStart=${PROJECT_DIR}/backend/node_modules/.bin/tsx src/index.ts
 # Restart=always catches BOTH crashes and clean exits (signal, OOM-with-exit-0).
-# StartLimitIntervalSec=0 disables the rate-limit that would otherwise stop
-# restarts after a few rapid failures. The "hung but alive" case (process up
-# but port not answering → user sees 502) is caught separately by
-# ai-ide-backend-healthcheck.timer further down.
+# The corresponding StartLimitIntervalSec=0 (disables the rate-limit) is in
+# the [Unit] section above — it has no effect in [Service] in modern systemd.
+# The "hung but alive" case (process up but port not answering → user sees
+# 502) is caught separately by ai-ide-backend-healthcheck.timer further down.
 Restart=always
 RestartSec=5
-StartLimitIntervalSec=0
 StandardOutput=journal
 StandardError=journal
 
@@ -414,28 +428,26 @@ cat > /etc/systemd/system/ai-ide-frontend.service <<EOF
 [Unit]
 Description=AI-IDE Frontend (Next.js on :${FRONTEND_PORT})
 After=network.target ai-ide-backend.service
+# See ai-ide-backend.service for why this lives in [Unit] not [Service].
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
 User=${TARGET_USER}
 WorkingDirectory=${PROJECT_DIR}/frontend
-# Inherit shared instance metadata + IAM creds from the wrapper user-data.
+# Identity + AWS creds + the browser-facing NEXT_PUBLIC_* URLs all come
+# from /etc/workspace.env, which user-data.sh.tftpl rewrites on every
+# new instance launched from this AMI. Keeping the per-user values out
+# of the unit file means the unit itself can be baked into the AMI
+# without leaking the source workspace's USER_ID / PLATFORM_DOMAIN.
 EnvironmentFile=/etc/workspace.env
-Environment=NEXT_PUBLIC_BACKEND_URL=${PLATFORM_PROTOCOL:-http}://api-${USER_ID}.${PLATFORM_DOMAIN}
-Environment=NEXT_PUBLIC_CODE_SERVER_URL=${PLATFORM_PROTOCOL:-http}://ide-${USER_ID}.${PLATFORM_DOMAIN}
-# Frontend uses these to detect platform-internal URLs in chat-link
-# buttons and ensure the corresponding service is registered before
-# the user's browser tries to load them.
-Environment=NEXT_PUBLIC_USER_ID=${USER_ID}
-Environment=NEXT_PUBLIC_PLATFORM_DOMAIN=${PLATFORM_DOMAIN}
 ExecStart=${PROJECT_DIR}/frontend/node_modules/.bin/next dev -p ${FRONTEND_PORT} -H 0.0.0.0
-# See ai-ide-backend.service for rationale on Restart=always +
-# StartLimitIntervalSec=0. Hung dev-server detection (Next.js sometimes wedges
-# with the HMR socket alive but HTTP no longer answering) is handled by
-# ai-ide-frontend-healthcheck.timer.
+# See ai-ide-backend.service for rationale on Restart=always (no-rate-limit
+# directive lives in [Unit] above). Hung dev-server detection (Next.js
+# sometimes wedges with the HMR socket alive but HTTP no longer answering)
+# is handled by ai-ide-frontend-healthcheck.timer.
 Restart=always
 RestartSec=5
-StartLimitIntervalSec=0
 StandardOutput=journal
 StandardError=journal
 
@@ -843,6 +855,7 @@ make_agent_unit() {
 Description=AI-IDE ${kind}-agent (port ${port}) — WS bridge to ONLYOFFICE plugin
 After=network.target ai-ide-backend.service ai-ide-onlyoffice.service
 Wants=ai-ide-onlyoffice.service
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -858,7 +871,6 @@ Environment=PORT=${port}
 ExecStart=${PROJECT_DIR}/backend/node_modules/.bin/tsx src/agent.ts
 Restart=always
 RestartSec=5
-StartLimitIntervalSec=0
 StandardOutput=journal
 StandardError=journal
 
@@ -1683,6 +1695,7 @@ cat > /etc/systemd/system/ai-ide-watchdog.service <<EOF
 Description=AI-IDE watchdog (probes Traefik-registered services, restarts dead ones)
 After=network-online.target ai-ide-backend.service ai-ide-frontend.service
 Wants=network-online.target
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -1690,7 +1703,6 @@ EnvironmentFile=/etc/workspace.env
 ExecStart=/usr/local/bin/ai-ide-watchdog.sh
 Restart=always
 RestartSec=10
-StartLimitIntervalSec=0
 StandardOutput=journal
 StandardError=journal
 
@@ -1710,276 +1722,52 @@ done_step "Step 9.6 — Service watchdog"
 as_user mkdir -p "${TARGET_HOME}/.claude/skills"
 
 # ────────────────────────────────────────────────────────────────────
-# Drop a CLAUDE.md so direct `claude` CLI invocations (terminal, code-
-# server, etc.) also get proxy-environment context — not just chat
-# requests routed through the backend, which inject the same content via
-# the SDK's appendSystemPrompt option.
+# NOTE: ~/.claude/CLAUDE.md (which bakes USER_ID + PLATFORM_DOMAIN into
+# its example URLs) is NOT written here — that's per-instance content
+# and lives in provision.sh so each fresh AMI launch lands the right
+# user's URLs in the file.
 # ────────────────────────────────────────────────────────────────────
 
-# Source /etc/workspace.env to get USER_ID / PLATFORM_DOMAIN. user-data.sh
-# already exported these for the parent shell, but cloud-init.sh runs in
-# its own shell — re-source defensively.
-if [ -f /etc/workspace.env ]; then
-  set -a
-  # shellcheck disable=SC1091
-  . /etc/workspace.env
-  set +a
-fi
-
-PROXY_DOMAIN="${PLATFORM_DOMAIN:-platform.bytescripterz.com}"
-PROXY_USER="${USER_ID:-unknown}"
-PROXY_SCHEME="${PLATFORM_PROTOCOL:-http}"
-
-cat > "${TARGET_HOME}/.claude/CLAUDE.md" <<MDEOF
-# Workspace environment
-
-This workspace runs behind an edge proxy + per-user Traefik. HTTP services
-exposed here are reachable from the user's browser ONLY through a public
-subdomain — \`http://localhost:<port>\` URLs are NOT reachable from the
-browser (it's on a different origin).
-
-## Default service URLs
-
-- Frontend (Next.js, port 3000):  ${PROXY_SCHEME}://frontend-${PROXY_USER}.${PROXY_DOMAIN}
-- Backend API (Hono, port 8090):  ${PROXY_SCHEME}://api-${PROXY_USER}.${PROXY_DOMAIN}
-- code-server / IDE (port 8080):  ${PROXY_SCHEME}://ide-${PROXY_USER}.${PROXY_DOMAIN}
-
-## Pre-installed office editors
-
-ONLYOFFICE Docs Server is installed by default on every workspace:
-
-- **docs**   (DOCX, port 4000): ${PROXY_SCHEME}://docs-${PROXY_USER}.${PROXY_DOMAIN}
-- **sheets** (XLSX, port 4001): ${PROXY_SCHEME}://sheets-${PROXY_USER}.${PROXY_DOMAIN}
-
-Don't send the user to those raw URLs — they serve ONLYOFFICE's own
-welcome page, not the user's document. To open a real document, use the
-backend's \`/api/office/config\` endpoint to get a signed editor config,
-then mount \`new DocsAPI.DocEditor(...)\` inside the frontend. The
-companion Playwright-driven sidecars \`docs-agent\` and \`sheets-agent\`
-host headless co-editor sessions and bridge MCP tool calls into the
-editor's JS API.
-
-When the user asks to edit a document or spreadsheet, prefer the
-\`docs_*\` / \`sheets_*\` MCP tools (when available) over UI automation.
-
-## Adding a new service
-
-When you start a new HTTP service in this workspace:
-
-1. Bind it to localhost or 0.0.0.0 on any unprivileged port.
-2. Register the port — either via the MCP tool \`register_service\` if
-   you're in chat, or directly:
-   \`\`\`bash
-   curl -X POST -H 'Content-Type: application/json' \\
-     -d '{"port": <PORT>}' \\
-     "\${PROXY_ROUTER_URL}/api/services/\${USER_ID}"
-   \`\`\`
-3. Use the returned URL — NOT \`http://localhost:<port>\` — anywhere the
-   browser needs to reach the service.
-
-Without step 2, browser fetches will fail with DNS / CORS errors.
-
-## Subdomain convention
-
-A registered port \`P\` (no custom name) becomes:
-  \`${PROXY_SCHEME}://port-P-${PROXY_USER}.${PROXY_DOMAIN}\`
-
-## CORS
-
-The browser's origin is \`${PROXY_SCHEME}://frontend-${PROXY_USER}.${PROXY_DOMAIN}\`.
-Backends must allow that origin (or \`*\`) on cross-origin XHR. The default
-backend already does.
-
-## Don't
-
-- Don't hardcode \`localhost\` / \`127.0.0.1\` URLs in browser-facing code.
-- Don't bind privileged ports (<1024). Port 80 is Traefik's.
-- Don't print \`http://localhost:<port>\` as the dev URL — the user will
-  copy it and get a broken page. Print the registered public URL instead.
-
-# Chat output: links
-
-Links you write in chat replies render as inline pill-buttons that open
-the URL as a workspace tab (not plain \`<a>\` tags). So:
-
-- Always write a URL as a markdown link with a short descriptive label:
-  \`[Open the dashboard](http://frontend-...)\`. Never paste raw URLs.
-- Don't say "navigate to ..." or "open ... in your browser". Just give
-  the link button — one click does it.
-- Code-formatted URLs (\`http://...\`) stay as code; only markdown links
-  become buttons. Use code for URLs the user copies, link syntax for
-  URLs they should open.
-
-# Iframe compatibility
-
-Every service exposed through the workspace is rendered inside an iframe
-in the user's AI-IDE UI. Anything you build MUST be embeddable or the
-user sees a blank tab.
-
-## Rule: don't block framing
-
-- Don't set \`X-Frame-Options: DENY\` or \`SAMEORIGIN\`. If a framework
-  sets it by default (Helmet, Spring Security, Django middleware, older
-  Next.js), remove or override it.
-- Don't set a CSP with \`frame-ancestors 'none'\` or \`frame-ancestors
-  'self'\`. Either omit \`frame-ancestors\` or use \`frame-ancestors *\`
-  (or the frontend origin specifically).
-- Don't write \"frame-buster\" JS like
-  \`if (window.top !== window.self) window.top.location = …\`.
-
-## Rule: cookies must work cross-origin
-
-The iframe URL is a different origin from the parent frontend, so any
-cookie the iframe relies on must be:
-
-- \`SameSite=None; Secure\` — required for cookies sent in a third-party
-  context. Plain \`SameSite=Lax\` cookies silently get dropped.
-- HTTPS-only once TLS is on. \`Secure\` is mandatory with \`SameSite=None\`.
-
-## Rule: auth flows can't full-page-redirect
-
-OAuth/SSO providers that redirect via \`top.location\` (or refuse to load
-in an iframe) break inside the workspace. When scaffolding auth, prefer:
-
-1. Backend-handled OAuth — provider redirects to your backend, which sets
-   the cookie and 302s to your app, all in the iframe.
-2. Popup-based auth — open a new window for the redirect, post the token
-   back to the iframe via \`postMessage\`.
-
-Warn the user explicitly if a chosen auth provider refuses iframe
-embedding (Google's OAuth screen does, Auth0's does too by default).
-
-# E2E testing with Playwright (Docker)
-
-This workspace has a long-running Docker container named
-\`ai-ide-playwright\` with Playwright + Chromium + Firefox + WebKit
-pre-installed. Use it for end-to-end tests and browser automation.
-
-## When to run E2E tests — project completion rule (DEFAULT, not opt-in)
-
-**After you finish a user-visible change to a project** — built a new
-page, added a form, wired up auth, fixed a UI bug, anything the user
-would interact with in a browser — you MUST run a Playwright E2E test
-against what you built BEFORE telling the user "done".
-
-**Do this even when the user did NOT ask for tests.** E2E verification
-on completion is the default behavior of this workspace.
-
-Skip only when: pure backend work with no UI, doc/config tweaks,
-one-shot scripts, user explicitly says "don't test", or the feature
-can't be tested headlessly.
-
-## How to run
-
-Always exec inside the container (the host may not have browsers / OS deps):
-
-\`\`\`bash
-docker exec -w /work/<subfolder> ai-ide-playwright \\
-  npm init playwright@latest -- --quiet --browser=chromium --lang=ts
-docker exec -w /work/<subfolder> ai-ide-playwright npx playwright test
-\`\`\`
-
-Reach host services via \`host.docker.internal\` instead of \`localhost\`.
-For services exposed through the workspace proxy, use the public proxy
-URL instead — it works from inside the container too.
-
-If \`docker exec ai-ide-playwright …\` errors with "no such container",
-bring it back up:
-\`docker compose -f ${PROJECT_DIR}/playwright/docker-compose.yml up -d\`
-
-# Environment packs (installed skills)
-
-This workspace has user-installed environment packs at \`~/.claude/skills/\`.
-Each pack's \`SKILL.md\` documents tool / library / config choices the user
-previously settled on. Packs are advisory **defaults** for cases where the
-user hasn't specified — they do not override an explicit user instruction.
-
-## Rule: when YOU are choosing, consult packs first
-
-When the user's request is open-ended about tools — e.g. "give me a
-database viewer" — and you would otherwise pick something on your own:
-
-1. List \`~/.claude/skills/\` and read every relevant SKILL.md.
-2. If a pack covers it, follow that pack verbatim.
-
-If you think the pack's choice is wrong, tell the user before deviating:
-
-> The <pack-name> pack specifies <X>, but I'd like to use <Y> here
-> because <reason>. OK to deviate from the pack?
-
-Then wait for their answer.
-
-## Rule: when the USER chooses, defer to the user (no pushback)
-
-If the user explicitly asks for a specific tool/library — e.g. "install
-pgweb" — just do it. Don't say "the pack specifies X instead". The user
-knows. This is often how they evolve their packs: try something off-pack,
-decide it works, bake it into the next pack revision.
-
-You may mention the conflict once, briefly, AFTER completing the task —
-e.g. "Installed pgweb. Heads-up: the <pack> pack has Mathesar as the
-default DB viewer; let me know if you'd like to update the pack."
-
-## Rule: cross-session memory
-
-When YOU are picking (not the user), packs are project-level decisions.
-A new session asking "give me a database viewer" should still produce
-whatever the pack says — re-list the packs.
-MDEOF
-chown "${TARGET_USER}:${TARGET_USER}" "${TARGET_HOME}/.claude/CLAUDE.md"
-
 # ────────────────────────────────────────────────────────────────────
-# Final summary
+# Mark the AMI version so provision.sh can detect a baked image and skip
+# anything that would otherwise re-do work that's already in the AMI.
 # ────────────────────────────────────────────────────────────────────
 
-hdr "All done — AI-IDE Studio is up"
+AMI_VERSION="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+printf '%s\n' "$AMI_VERSION" > /etc/ai-ide-ami-version
+chmod 644 /etc/ai-ide-ami-version
 
-# Public IP is exported by user-data.sh.tftpl (which already queries IMDSv2
-# during bootstrap). Fall back to a placeholder only if this script is run
-# manually outside that context.
-PUBLIC_IP="${PUBLIC_IP:-<EC2_PUBLIC_IP>}"
+# ────────────────────────────────────────────────────────────────────
+# Bake summary
+# ────────────────────────────────────────────────────────────────────
+
+hdr "Bake complete — ready to snapshot into an AMI"
 
 cat <<EOF
 
-  ${BOLD}${GREEN}✓ AI-IDE Studio is up on this EC2 instance.${NC}
+  ${BOLD}${GREEN}✓ Workspace AMI bake finished.${NC}  Version: ${CYAN}${AMI_VERSION}${NC}
 
-  ${BOLD}Public endpoints${NC} (via the central edge proxy + per-user Traefik on :80):
-    ${GREEN}•${NC} Frontend:    ${CYAN}${PLATFORM_PROTOCOL:-http}://frontend-${USER_ID:-<USER_ID>}.${PLATFORM_DOMAIN:-<PLATFORM_DOMAIN>}/${NC}
-    ${GREEN}•${NC} Backend API: ${CYAN}${PLATFORM_PROTOCOL:-http}://api-${USER_ID:-<USER_ID>}.${PLATFORM_DOMAIN:-<PLATFORM_DOMAIN>}/${NC}
-    ${GREEN}•${NC} code-server: ${CYAN}${PLATFORM_PROTOCOL:-http}://ide-${USER_ID:-<USER_ID>}.${PLATFORM_DOMAIN:-<PLATFORM_DOMAIN>}/${NC}   ${YELLOW}(NO password!)${NC}
+  Next steps (run from your admin workstation, NOT inside this EC2):
+    ${DIM}1. Stop the instance:${NC}
+       ${DIM}aws ec2 stop-instances --instance-ids <id> --profile phase1-deploy${NC}
+    ${DIM}2. Wait for stopped state, then snapshot:${NC}
+       ${DIM}aws ec2 create-image --instance-id <id> \\
+         --name "ai-workspace-${AMI_VERSION}" \\
+         --description "AI-IDE workspace baked $(date -u)" \\
+         --no-reboot \\
+         --profile phase1-deploy${NC}
+    ${DIM}3. Plug the resulting AMI id into terraform/workspace tfvars as${NC}
+       ${DIM}workspace_ami_id, or set WORKSPACE_AMI_ID in the landing-page env.${NC}
 
-  ${BOLD}Internal ports${NC} (bypass Traefik, useful only for SSH debugging):
-    ${GREEN}•${NC} Frontend → ${CYAN}127.0.0.1:${FRONTEND_PORT}${NC}
-    ${GREEN}•${NC} Backend  → ${CYAN}127.0.0.1:${BACKEND_PORT}${NC}
-    ${GREEN}•${NC} code-server → ${CYAN}127.0.0.1:${CODE_SERVER_PORT}${NC}
-    ${GREEN}•${NC} Direct EC2 IP: ${CYAN}${PUBLIC_IP}${NC}
-
-  ${BOLD}Playwright + Chromium${NC} (Docker container — for tests / AI panel):
-    ${GREEN}•${NC} Container:   ${CYAN}${PLAYWRIGHT_CONTAINER}${NC}
-    ${GREEN}•${NC} Compose:     ${CYAN}${PLAYWRIGHT_DIR}/docker-compose.yml${NC}
-    ${GREEN}•${NC} Try:         ${DIM}docker exec -it ${PLAYWRIGHT_CONTAINER} npx playwright --version${NC}
-    ${GREEN}•${NC} Run a test:  ${DIM}docker exec -it ${PLAYWRIGHT_CONTAINER} npx playwright test${NC}
-
-  ${BOLD}Service controls${NC} (run on the EC2 instance):
-    ${DIM}sudo systemctl status  ai-ide-backend${NC}
-    ${DIM}sudo systemctl restart ai-ide-frontend${NC}
-    ${DIM}sudo journalctl -u ai-ide-backend -f${NC}
-    ${DIM}sudo journalctl -u ai-ide-frontend -f${NC}
-    ${DIM}sudo journalctl -u code-server@${TARGET_USER} -f${NC}
-    ${DIM}docker logs -f ${PLAYWRIGHT_CONTAINER}${NC}
-
-  ${BOLD}Install log:${NC} ${CYAN}${LOG_FILE}${NC}
+  Per-instance setup (USER_ID, OFFICE_JWT_SECRET, ~/.claude/CLAUDE.md,
+  git pull on the repos, service restarts) is handled by provision.sh
+  on every new instance launched from the AMI.
 
   ${BOLD}${YELLOW}⚠ SECURITY WARNING${NC}
-    code-server is publicly exposed on port ${CODE_SERVER_PORT} without
-    authentication. Anyone reaching this IP has a root shell. Either:
-      ${YELLOW}-${NC} Restrict EC2 Security Group inbound to your IP only, OR
-      ${YELLOW}-${NC} Enable auth: edit ${TARGET_HOME}/.config/code-server/config.yaml
-        and run ${DIM}'sudo systemctl restart code-server@${TARGET_USER}'${NC}.
+    code-server is configured WITHOUT authentication and binds 0.0.0.0:${CODE_SERVER_PORT}.
+    Restrict the EC2 SG, or enable auth in
+    ${TARGET_HOME}/.config/code-server/config.yaml before exposing this AMI.
 
-  ${BOLD}Claude skills are NOT pre-installed.${NC} After SSH'ing in, either:
-    ${GREEN}-${NC} Copy your skills folder to ${CYAN}${TARGET_HOME}/.claude/skills/${NC}, OR
-    ${GREEN}-${NC} Tell Claude in chat: "Create a pack for <platform>" — the
-      create-platform-pack meta-skill will scaffold it (if it exists).
+  ${BOLD}Bake log:${NC} ${CYAN}${LOG_FILE}${NC}
 
 EOF

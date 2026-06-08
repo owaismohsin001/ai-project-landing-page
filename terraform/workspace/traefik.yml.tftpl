@@ -30,6 +30,10 @@ providers:
     pollInterval: "${config_poll_seconds}s"
     pollTimeout: "5s"
 
-api:
-  dashboard: false
-  insecure: false
+# No api: block. Defining it (even with dashboard:false/insecure:false)
+# causes Traefik to auto-create a `traefik` entrypoint on :8080 for the
+# API. On a baked workspace AMI :8080 belongs to code-server, and which
+# of the two starts first is a race — when code-server wins, Traefik
+# crashloops with "listen tcp :8080: bind: address already in use" and
+# the per-user proxy is dead. We don't use the Traefik API/dashboard, so
+# leave the block out entirely.

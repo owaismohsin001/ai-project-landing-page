@@ -414,13 +414,18 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    // Static-file bootstrap endpoint. Serves the workspace cloud-init.sh
+    // Static-file bootstrap endpoint. Serves the workspace provision.sh
     // (and any other small bootstrap script we drop alongside) so per-user
     // EC2s don't have to embed it in their own user-data. Limited to a
     // strict allow-list of filenames to prevent path traversal.
+    //
+    // provision.sh is the per-instance tail that runs on every new EC2
+    // launched from the workspace AMI; cloud-init.sh is kept on disk for
+    // any pre-AMI-cutover instances that still curl the old name (drop
+    // safely after a few weeks of no traffic).
     const sm = path.match(/^\/bootstrap\/([A-Za-z0-9_.-]+)$/);
     if (sm && req.method === "GET") {
-      const allowed = new Set(["cloud-init.sh"]);
+      const allowed = new Set(["provision.sh", "cloud-init.sh"]);
       if (!allowed.has(sm[1])) {
         jsonResponse(res, 404, { error: "not found" });
         return;
