@@ -985,215 +985,357 @@ hdr "Step 9.5 — Auto service-snapshot + restore on boot/update"
 log "Writing /usr/local/bin/service-manager.sh"
 cat > /usr/local/bin/service-manager.sh <<'SVC_EOF'
 #!/usr/bin/env bash
-# service-manager.sh — snapshot + restore: systemd services, Docker containers, tmux sessions
+# service-manager.sh — dynamic snapshot + restore
+# Captures: systemd services, Docker containers, tmux sessions (with window details), user processes
 set -euo pipefail
 
 SNAPSHOT_DIR="/var/lib/service-manager"
 SNAPSHOT_FILE="$SNAPSHOT_DIR/running-services.json"
 LOG_FILE="$SNAPSHOT_DIR/service-manager.log"
 RECIPES_DIR="/home/ubuntu/.ai-ide/services"
+UBUNTU_USER="ubuntu"
 mkdir -p "$SNAPSHOT_DIR"
 
 _log() {
   local ts; ts=$(date '+%Y-%m-%d %H:%M:%S')
-  local msg="[$ts] [${2:-INFO}] $1"
-  echo "$msg"
-  echo "$msg" >> "$LOG_FILE"
+  printf '[%s] [%s] %s\n' "$ts" "${2:-INFO}" "$1" | tee -a "$LOG_FILE"
 }
-
 _docker_ok() { command -v docker &>/dev/null && docker info &>/dev/null 2>&1; }
 _tmux_ok()   { command -v tmux &>/dev/null; }
 
+# Walk up /proc/PID/stat to check if $1 is a descendant of any PID in $2 (space-separated)
+_has_ancestor_in() {
+  local pid=$1 ancestors=$2 cur=$1
+  while [[ "$cur" -gt 1 ]]; do
+    [[ " $ancestors " == *" $cur "* ]] && return 0
+    cur=$(awk '{print $4}' "/proc/$cur/stat" 2>/dev/null) || return 1
+    [[ -z "$cur" || "$cur" == "0" ]] && return 1
+  done
+  return 1
+}
+
+_capture_systemd() {
+  local svc_json="[" first=1
+  while IFS= read -r s; do
+    [[ -z "$s" ]] && continue
+    local desc; desc=$(systemctl show "$s" -p Description --value 2>/dev/null || true)
+    desc="${desc//\"/\\\"}"; [[ $first -eq 0 ]] && svc_json+=","
+    svc_json+="{\"name\":\"$s\",\"description\":\"$desc\"}"; first=0
+  done < <(systemctl list-units --type=service --state=running --no-legend --plain | awk '{print $1}')
+  echo "${svc_json}]"
+}
+
+_capture_docker() {
+  ! _docker_ok && echo "[]" && return
+  local arr=()
+  while IFS='|' read -r name image; do
+    [[ -z "$name" ]] && continue
+    arr+=("{\"name\":\"$name\",\"image\":\"$image\"}")
+  done < <(docker ps --format '{{.Names}}|{{.Image}}' 2>/dev/null)
+  [[ ${#arr[@]} -gt 0 ]] && printf '[%s]' "$(IFS=','; echo "${arr[*]}")" || echo "[]"
+}
+
+_capture_tmux() {
+  ! _tmux_ok && echo "[]" && return
+  local sessions=()
+  while IFS= read -r sess; do
+    [[ -z "$sess" ]] && continue
+    local windows="[" wfirst=1
+    while IFS='|' read -r widx wname cmd path; do
+      [[ $wfirst -eq 0 ]] && windows+=","
+      cmd="${cmd//\"/\\\"}"; path="${path//\"/\\\"}"
+      windows+="{\"index\":${widx},\"name\":\"${wname//\"/\\\"}\",\"cmd\":\"$cmd\",\"path\":\"$path\"}"
+      wfirst=0
+    done < <(tmux list-windows -t "$sess" \
+      -F '#{window_index}|#{window_name}|#{pane_current_command}|#{pane_current_path}' 2>/dev/null || true)
+    windows+="]"
+    sessions+=("{\"name\":\"${sess//\"/\\\"}\",\"windows\":$windows}")
+  done < <(tmux list-sessions -F '#{session_name}' 2>/dev/null || true)
+  [[ ${#sessions[@]} -gt 0 ]] && printf '[%s]' "$(IFS=','; echo "${sessions[*]}")" || echo "[]"
+}
+
+_capture_user_procs() {
+  local tmux_pids=""
+  _tmux_ok && tmux_pids=$(tmux list-panes -a -F '#{pane_pid}' 2>/dev/null | tr '\n' ' ' || true)
+  local blacklist=" bash sh zsh fish dash tee grep awk sed cat less more tail head vim nano vi ps top htop "
+  local procs=()
+  while IFS=' ' read -r pid comm; do
+    [[ -z "$pid" || ! -d "/proc/$pid" ]] && continue
+    [[ "$blacklist" == *" $comm "* ]] && continue
+    [[ -z "$(tr -d '\0' < "/proc/$pid/cmdline" 2>/dev/null)" ]] && continue
+    grep -q 'system\.slice.*\.service' "/proc/$pid/cgroup" 2>/dev/null && continue
+    [[ -n "$tmux_pids" ]] && _has_ancestor_in "$pid" "$tmux_pids" 2>/dev/null && continue
+    local cmdline cwd
+    cmdline=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | sed 's/ $//' || echo "$comm")
+    cwd=$(readlink "/proc/$pid/cwd" 2>/dev/null || echo "unknown")
+    cmdline="${cmdline//\"/\\\"}"; cwd="${cwd//\"/\\\"}"; comm="${comm//\"/\\\"}"
+    procs+=("{\"pid\":$pid,\"comm\":\"$comm\",\"cmdline\":\"$cmdline\",\"cwd\":\"$cwd\"}")
+  done < <(ps -u "$UBUNTU_USER" --no-headers -o pid,comm 2>/dev/null)
+  [[ ${#procs[@]} -gt 0 ]] && printf '[%s]' "$(IFS=','; echo "${procs[*]}")" || echo "[]"
+}
+
 cmd_save() {
   _log "Snapshot save ho raha hai..."
-
-  # systemd services
-  mapfile -t svcs < <(
-    systemctl list-units --type=service --state=running --no-legend --plain \
-      | awk '{print $1}'
-  )
-  local svc_json="[" first=1
-  for s in "${svcs[@]}"; do
-    local desc; desc=$(systemctl show "$s" -p Description --value 2>/dev/null || true)
-    desc="${desc//\"/\\\"}"
-    [[ $first -eq 0 ]] && svc_json+=","
-    svc_json+="{\"name\":\"$s\",\"description\":\"$desc\"}"
-    first=0
-  done
-  svc_json+="]"
-
-  # Docker containers
-  local docker_json="[]"
-  if _docker_ok; then
-    local arr=()
-    while IFS='|' read -r name image; do
-      [[ -z "$name" ]] && continue
-      arr+=("{\"name\":\"$name\",\"image\":\"$image\"}")
-    done < <(docker ps --format '{{.Names}}|{{.Image}}' 2>/dev/null)
-    [[ ${#arr[@]} -gt 0 ]] && docker_json="[$(IFS=','; echo "${arr[*]}")]"
-    _log "Docker containers: ${#arr[@]}"
-  fi
-
-  # tmux sessions
-  local tmux_json="[]"
-  if _tmux_ok; then
-    local tarr=()
-    while IFS= read -r sess; do
-      [[ -z "$sess" ]] && continue
-      tarr+=("\"$sess\"")
-    done < <(tmux list-sessions -F '#{session_name}' 2>/dev/null || true)
-    [[ ${#tarr[@]} -gt 0 ]] && tmux_json="[$(IFS=','; echo "${tarr[*]}")]"
-    _log "tmux sessions: ${#tarr[@]}"
-  fi
-
-  printf '{\n  "saved_at": "%s",\n  "systemd_services": %s,\n  "docker_containers": %s,\n  "tmux_sessions": %s\n}\n' \
-    "$(date '+%Y-%m-%d %H:%M:%S')" "$svc_json" "$docker_json" "$tmux_json" > "$SNAPSHOT_FILE"
-
-  _log "Saved: ${#svcs[@]} systemd, Docker, tmux → $SNAPSHOT_FILE"
+  local svc_json docker_json tmux_json procs_json
+  svc_json=$(_capture_systemd)
+  docker_json=$(_capture_docker)
+  tmux_json=$(_capture_tmux)
+  procs_json=$(_capture_user_procs)
+  printf '{\n  "saved_at": "%s",\n  "systemd_services": %s,\n  "docker_containers": %s,\n  "tmux_sessions": %s,\n  "user_procs": %s\n}\n' \
+    "$(date '+%Y-%m-%d %H:%M:%S')" "$svc_json" "$docker_json" "$tmux_json" "$procs_json" > "$SNAPSHOT_FILE"
+  python3 -c "
+import json; d=json.load(open('$SNAPSHOT_FILE'))
+print(f'  systemd:{len(d[chr(34)+\"systemd_services\"+chr(34)])} docker:{len(d[chr(34)+\"docker_containers\"+chr(34)])} tmux:{len(d[chr(34)+\"tmux_sessions\"+chr(34)])} procs:{len(d[chr(34)+\"user_procs\"+chr(34)])}')" 2>/dev/null | while read -r l; do _log "$l"; done
+  _log "Snapshot saved → $SNAPSHOT_FILE"
 }
 
 cmd_restore() {
-  if [[ ! -f "$SNAPSHOT_FILE" ]]; then
-    _log "Snapshot nahi mila: $SNAPSHOT_FILE — pehle 'save' chalao" ERROR
-    exit 1
-  fi
-
+  [[ -f "$SNAPSHOT_FILE" ]] || { _log "Snapshot nahi mila — pehle 'save' chalao" ERROR; exit 1; }
   local saved_at
   saved_at=$(python3 -c "import json; print(json.load(open('$SNAPSHOT_FILE'))['saved_at'])" 2>/dev/null || echo "?")
   _log "Restore from snapshot ($saved_at)"
-
   local ok=0 fail=0 skip=0
 
-  # systemd
   while IFS= read -r svc; do
     [[ -z "$svc" ]] && continue
-    if ! systemctl list-unit-files "$svc" &>/dev/null; then
-      _log "Not found: $svc" WARN; ((skip++)) || true; continue
-    fi
-    if [[ "$(systemctl is-active "$svc" 2>/dev/null || true)" == "active" ]]; then
-      ((skip++)) || true; continue
-    fi
-    if systemctl start "$svc" 2>/dev/null; then
-      _log "Started: $svc"; ((ok++)) || true
-    else
-      _log "Failed:  $svc" ERROR; ((fail++)) || true
-    fi
-  done < <(python3 -c "
-import json
-for s in json.load(open('$SNAPSHOT_FILE')).get('systemd_services', []):
-    print(s['name'])
-" 2>/dev/null)
+    systemctl list-unit-files "$svc" &>/dev/null || { ((skip++)) || true; continue; }
+    [[ "$(systemctl is-active "$svc" 2>/dev/null || true)" == "active" ]] && { ((skip++)) || true; continue; }
+    if systemctl start "$svc" 2>/dev/null; then _log "Started: $svc"; ((ok++)) || true
+    else _log "Failed: $svc" ERROR; ((fail++)) || true; fi
+  done < <(python3 -c "import json
+for s in json.load(open('$SNAPSHOT_FILE')).get('systemd_services',[]): print(s['name'])" 2>/dev/null)
 
-  # Docker
   if _docker_ok; then
     while IFS= read -r c; do
       [[ -z "$c" ]] && continue
-      local state; state=$(docker inspect --format '{{.State.Status}}' "$c" 2>/dev/null || echo "not_found")
-      if [[ "$state" == "running" ]]; then ((skip++)) || true; continue; fi
-      if [[ "$state" == "not_found" ]]; then
-        _log "Docker not found: $c" WARN; ((skip++)) || true; continue
-      fi
-      if docker start "$c" &>/dev/null; then
-        _log "Docker started: $c"; ((ok++)) || true
-      else
-        _log "Docker failed:  $c" ERROR; ((fail++)) || true
-      fi
-    done < <(python3 -c "
-import json
-for c in json.load(open('$SNAPSHOT_FILE')).get('docker_containers', []):
-    print(c['name'])
-" 2>/dev/null)
+      local st; st=$(docker inspect --format '{{.State.Status}}' "$c" 2>/dev/null || echo "not_found")
+      [[ "$st" == "running" || "$st" == "not_found" ]] && { ((skip++)) || true; continue; }
+      if docker start "$c" &>/dev/null; then _log "Docker: $c"; ((ok++)) || true
+      else ((fail++)) || true; fi
+    done < <(python3 -c "import json
+for c in json.load(open('$SNAPSHOT_FILE')).get('docker_containers',[]): print(c['name'])" 2>/dev/null)
   fi
 
-  # tmux sessions — recipe file se restart karo
   if _tmux_ok; then
-    while IFS= read -r sess; do
-      [[ -z "$sess" ]] && continue
-      if tmux has-session -t "$sess" 2>/dev/null; then
-        ((skip++)) || true; continue
-      fi
-      local recipe="$RECIPES_DIR/${sess}.sh"
-      if [[ -f "$recipe" ]]; then
-        if sudo -u ubuntu tmux new-session -d -s "$sess" "bash '$recipe'" 2>/dev/null; then
-          _log "tmux started: $sess (recipe: $recipe)"; ((ok++)) || true
-        else
-          _log "tmux failed:  $sess" ERROR; ((fail++)) || true
-        fi
-      else
-        _log "tmux '$sess' — recipe nahi mila ($recipe), manually start karo" WARN
-        ((skip++)) || true
-      fi
-    done < <(python3 -c "
-import json
-for s in json.load(open('$SNAPSHOT_FILE')).get('tmux_sessions', []):
-    print(s)
-" 2>/dev/null)
+    python3 - <<'PY'
+import json, subprocess, os
+SNAPSHOT = '/var/lib/service-manager/running-services.json'
+RECIPES  = '/home/ubuntu/.ai-ide/services'
+USER     = 'ubuntu'
+d = json.load(open(SNAPSHOT))
+for si in d.get('tmux_sessions', []):
+    sess = si['name']
+    r = subprocess.run(['tmux','has-session','-t',sess], capture_output=True)
+    if r.returncode == 0:
+        print(f'  [SKIP] tmux running: {sess}'); continue
+    recipe = f'{RECIPES}/{sess}.sh'
+    if os.path.exists(recipe):
+        r2 = subprocess.run(['sudo','-u',USER,'tmux','new-session','-d','-s',sess,'bash',recipe])
+        print(f"  {'[OK]' if r2.returncode==0 else '[ERR]'} tmux (recipe): {sess}"); continue
+    windows = si.get('windows', [])
+    if not windows:
+        print(f'  [WARN] tmux {sess} — no recipe, no saved windows'); continue
+    first = windows[0]
+    r2 = subprocess.run(['sudo','-u',USER,'tmux','new-session','-d','-s',sess,'-c',first['path'],first['cmd']])
+    if r2.returncode != 0:
+        print(f'  [ERR] tmux create failed: {sess}'); continue
+    for w in windows[1:]:
+        subprocess.run(['sudo','-u',USER,'tmux','new-window','-t',sess,'-c',w['path'],'-n',w['name'],w['cmd']], capture_output=True)
+    print(f"  [OK]  tmux restored (saved commands): {sess} — {len(windows)} window(s)")
+
+for proc in d.get('user_procs', []):
+    r = subprocess.run(['pgrep','-u',USER,'-f',proc['cmdline'][:60]], capture_output=True)
+    if r.returncode == 0:
+        print(f"  [SKIP] running: {proc['comm']}"); continue
+    sname = f"proc-{proc['comm']}"
+    r2 = subprocess.run(['sudo','-u',USER,'tmux','new-session','-d','-s',sname,'-c',proc['cwd'],proc['cmdline']], capture_output=True)
+    print(f"  {'[OK]' if r2.returncode==0 else '[WARN]'} proc: {proc['comm']} — {proc['cmdline'][:70]}")
+PY
   fi
 
-  _log "Restore done — started:$ok  skipped:$skip  failed:$fail"
+  _log "Restore done — ok:$ok fail:$fail skip:$skip"
 }
 
 cmd_status() {
-  if [[ ! -f "$SNAPSHOT_FILE" ]]; then
-    echo "No snapshot found. Run: sudo service-manager.sh save"
-    return
-  fi
   python3 - <<'PY'
-import json, subprocess
+import json, subprocess, os
 
-SNAPSHOT  = '/var/lib/service-manager/running-services.json'
-RECIPES   = '/home/ubuntu/.ai-ide/services'
+SNAPSHOT = '/var/lib/service-manager/running-services.json'
+RECIPES  = '/home/ubuntu/.ai-ide/services'
+
+if not os.path.exists(SNAPSHOT):
+    print("No snapshot found. Run: sudo service-manager.sh save"); exit(0)
+
 d = json.load(open(SNAPSHOT))
-
-tmux_count = len(d.get('tmux_sessions', []))
 print(f"\nSnapshot : {d['saved_at']}")
-print(f"Systemd  : {len(d['systemd_services'])}  |  Docker: {len(d['docker_containers'])}  |  tmux: {tmux_count}\n")
+print(f"Systemd: {len(d['systemd_services'])}  Docker: {len(d['docker_containers'])}  "
+      f"tmux: {len(d.get('tmux_sessions',[]))}  procs: {len(d.get('user_procs',[]))}\n")
 
 print("=== Systemd Services ===")
 for s in d['systemd_services']:
-    r = subprocess.run(['systemctl', 'is-active', s['name']], capture_output=True, text=True)
-    icon = '[OK]' if r.stdout.strip() == 'active' else '[--]'
-    print(f"  {icon} {s['name']}")
+    r = subprocess.run(['systemctl','is-active',s['name']], capture_output=True, text=True)
+    print(f"  {'[OK]' if r.stdout.strip()=='active' else '[--]'} {s['name']}")
 
 if d['docker_containers']:
     print("\n=== Docker Containers ===")
     for c in d['docker_containers']:
-        r = subprocess.run(['docker', 'inspect', '--format', '{{.State.Status}}', c['name']],
-                           capture_output=True, text=True)
+        r = subprocess.run(['docker','inspect','--format','{{.State.Status}}',c['name']], capture_output=True, text=True)
         state = r.stdout.strip() or 'not_found'
-        icon = '[OK]' if state == 'running' else '[--]'
-        print(f"  {icon} {c['name']} ({c['image']}) — {state}")
+        print(f"  {'[OK]' if state=='running' else '[--]'} {c['name']} ({c['image']}) — {state}")
 
-if d.get('tmux_sessions'):
+r = subprocess.run(['tmux','list-panes','-a','-F',
+                    '#{session_name}|#{window_index}|#{pane_current_command}|#{pane_current_path}'],
+                   capture_output=True, text=True)
+live = {}
+for line in r.stdout.strip().splitlines():
+    if not line: continue
+    parts = line.split('|', 3)
+    if len(parts) == 4:
+        live.setdefault(parts[0], []).append((parts[1], parts[2], parts[3]))
+
+if d.get('tmux_sessions') or live:
     print("\n=== tmux Sessions ===")
-    r = subprocess.run(['tmux', 'list-sessions', '-F', '#{session_name}'],
-                       capture_output=True, text=True)
+    saved_names = set()
+    for si in d.get('tmux_sessions', []):
+        sess = si['name']; saved_names.add(sess)
+        alive = sess in live
+        recipe = '(recipe)' if os.path.exists(f"{RECIPES}/{sess}.sh") else ''
+        print(f"  {'[OK]' if alive else '[--]'} {sess} {recipe}")
+        if alive:
+            for widx, cmd, path in live[sess]:
+                print(f"         [{widx}] {cmd:<25}  <- {path}")
+        else:
+            for w in si.get('windows', []):
+                print(f"         [{w['index']}] {w['cmd']:<25}  <- {w['path']}  (saved)")
+    new_sess = set(live.keys()) - saved_names
+    if new_sess:
+        print("\n  -- Live (not in snapshot — run save to capture) --")
+        for sess in sorted(new_sess):
+            print(f"  [NEW] {sess}")
+            for widx, cmd, path in live[sess]:
+                print(f"         [{widx}] {cmd:<25}  <- {path}")
+
+if d.get('user_procs'):
+    print("\n=== User Processes ===")
+    r = subprocess.run(['ps','-u','ubuntu','--no-headers','-o','comm'], capture_output=True, text=True)
     running = set(r.stdout.strip().splitlines())
-    import os
-    for sess in d['tmux_sessions']:
-        icon = '[OK]' if sess in running else '[--]'
-        recipe = f"{RECIPES}/{sess}.sh"
-        has_recipe = '(recipe ok)' if os.path.exists(recipe) else '(no recipe — manual restart needed)'
-        print(f"  {icon} {sess} {has_recipe}")
+    for proc in d['user_procs']:
+        icon = '[OK]' if proc['comm'] in running else '[--]'
+        print(f"  {icon} {proc['comm']}")
+        print(f"         {proc['cmdline'][:90]}")
+        print(f"         cwd: {proc['cwd']}")
 print()
 PY
+}
+
+cmd_watch() {
+  local interval="${WATCHDOG_INTERVAL:-30}"
+  _log "Watchdog started — interval: ${interval}s"
+
+  while true; do
+    if [[ ! -f "$SNAPSHOT_FILE" ]]; then
+      sleep "$interval"; continue
+    fi
+
+    # ── systemd ──
+    while IFS= read -r svc; do
+      [[ -z "$svc" ]] && continue
+      [[ "$(systemctl is-active "$svc" 2>/dev/null || echo inactive)" == "active" ]] && continue
+      _log "DEAD: $svc — restarting" WARN
+      systemctl start "$svc" 2>/dev/null \
+        && _log "RESTARTED: $svc" \
+        || _log "RESTART FAILED: $svc" ERROR
+    done < <(python3 -c "import json
+for s in json.load(open('$SNAPSHOT_FILE')).get('systemd_services',[]): print(s['name'])" 2>/dev/null)
+
+    # ── Docker ──
+    if _docker_ok; then
+      while IFS='|' read -r name _image; do
+        [[ -z "$name" ]] && continue
+        state=$(docker inspect --format '{{.State.Status}}' "$name" 2>/dev/null || echo "not_found")
+        [[ "$state" == "running" || "$state" == "not_found" ]] && continue
+        _log "DEAD: docker $name (state=$state) — restarting" WARN
+        docker start "$name" &>/dev/null \
+          && _log "RESTARTED: docker $name" \
+          || _log "RESTART FAILED: docker $name" ERROR
+      done < <(python3 -c "import json
+for c in json.load(open('$SNAPSHOT_FILE')).get('docker_containers',[]): print(c['name']+'|'+c['image'])" 2>/dev/null)
+    fi
+
+    # ── tmux ──
+    if _tmux_ok; then
+      python3 - <<'PYWATCH'
+import json, subprocess, os
+SNAPSHOT = '/var/lib/service-manager/running-services.json'
+RECIPES  = '/home/ubuntu/.ai-ide/services'
+USER     = 'ubuntu'
+d = json.load(open(SNAPSHOT))
+for si in d.get('tmux_sessions', []):
+    sess = si['name']
+    r = subprocess.run(['tmux', 'has-session', '-t', sess], capture_output=True)
+    if r.returncode == 0: continue
+    print(f'DEAD: tmux session "{sess}" — restarting', flush=True)
+    recipe = f'{RECIPES}/{sess}.sh'
+    if os.path.exists(recipe):
+        r2 = subprocess.run(['sudo', '-u', USER, 'tmux', 'new-session', '-d', '-s', sess, 'bash', recipe])
+        print(f"{'RESTARTED' if r2.returncode==0 else 'RESTART FAILED'}: tmux {sess}", flush=True)
+        continue
+    windows = si.get('windows', [])
+    if not windows:
+        print(f'RESTART SKIPPED: tmux {sess} — no recipe, no saved windows', flush=True); continue
+    first = windows[0]
+    r2 = subprocess.run(['sudo', '-u', USER, 'tmux', 'new-session', '-d',
+                         '-s', sess, '-c', first['path'], first['cmd']])
+    if r2.returncode == 0:
+        for w in windows[1:]:
+            subprocess.run(['sudo', '-u', USER, 'tmux', 'new-window', '-t', sess,
+                            '-c', w['path'], '-n', w['name'], w['cmd']], capture_output=True)
+        print(f'RESTARTED: tmux {sess} (from saved windows)', flush=True)
+    else:
+        print(f'RESTART FAILED: tmux {sess}', flush=True)
+PYWATCH
+    fi
+
+    sleep "$interval"
+  done
 }
 
 case "${1:-}" in
   save)    cmd_save ;;
   restore) cmd_restore ;;
   status)  cmd_status ;;
+  watch)   cmd_watch ;;
   *)
-    echo "Usage: sudo $0 {save|restore|status}"
-    echo "  save     — running services ka snapshot lo (systemd + Docker + tmux)"
-    echo "  restore  — snapshot se services wapas start karo"
-    echo "  status   — snapshot vs current state compare karo"
+    echo "Usage: sudo $0 {save|restore|status|watch}"
+    echo "  save     — sab running cheezein snapshot karo"
+    echo "  restore  — snapshot se sab wapas start karo"
+    echo "  status   — current vs snapshot compare karo"
+    echo "  watch    — watchdog: jo bhi mare use restart karo (daemon)"
     exit 1
     ;;
 esac
 SVC_EOF
 chmod 755 /usr/local/bin/service-manager.sh
 ok "service-manager.sh installed at /usr/local/bin/"
+
+log "Installing service-manager-watchdog.service (auto-restart died services)"
+cat > /etc/systemd/system/service-manager-watchdog.service <<'WATCHDOG_EOF'
+[Unit]
+Description=Service Watchdog — auto-restart died services every 30s
+After=network.target docker.service
+Wants=docker.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/service-manager.sh watch
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+WATCHDOG_EOF
 
 log "APT hooks install ho rahe hain (pre-invoke: save, post-invoke: restore)"
 # DPkg::Pre-Invoke  fires before dpkg processes any package — captures the
@@ -1234,7 +1376,11 @@ log "Initial snapshot le raha hai..."
 /usr/local/bin/service-manager.sh save
 ok "Initial snapshot → /var/lib/service-manager/running-services.json"
 
-done_step "Step 9.5 — Auto service-snapshot + restore"
+systemctl daemon-reload
+systemctl enable --now service-manager-watchdog.service
+ok "Watchdog enabled — har 30s mein check karega, jo mara restart karega"
+
+done_step "Step 9.5 — Auto service-snapshot + restore + watchdog"
 
 # ────────────────────────────────────────────────────────────────────
 # Make sure .claude/skills dir exists for future skill installs
