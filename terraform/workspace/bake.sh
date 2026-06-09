@@ -751,6 +751,11 @@ services:
       - ${ONLYOFFICE_DIR}/docs/data:/var/www/onlyoffice/Data
       - ${ONLYOFFICE_DIR}/docs/lib:/var/lib/onlyoffice
       - ${ONLYOFFICE_DIR}/docs/db:/var/lib/postgresql
+      # Force ONLYOFFICE to generate https:// asset URLs (see nginx patch
+      # below) — the per-user Traefik proxy terminates TLS but doesn't
+      # forward X-Forwarded-Proto, so without this the editor emits
+      # http:// URLs and the browser blocks them as Mixed Content.
+      - ${ONLYOFFICE_DIR}/nginx/http-common.conf:/etc/onlyoffice/documentserver/nginx/includes/http-common.conf:ro
 
   sheets:
     image: ${ONLYOFFICE_IMAGE}
@@ -767,6 +772,8 @@ services:
       - ${ONLYOFFICE_DIR}/sheets/data:/var/www/onlyoffice/Data
       - ${ONLYOFFICE_DIR}/sheets/lib:/var/lib/onlyoffice
       - ${ONLYOFFICE_DIR}/sheets/db:/var/lib/postgresql
+      # Force https:// asset URLs — see the docs service + nginx patch.
+      - ${ONLYOFFICE_DIR}/nginx/http-common.conf:/etc/onlyoffice/documentserver/nginx/includes/http-common.conf:ro
 EOF
 
 # Also drop a .env file alongside the compose file so an operator running
@@ -780,6 +787,42 @@ chmod 600 "${ONLYOFFICE_DIR}/.env"
 log "Pulling ${ONLYOFFICE_IMAGE} (~700MB — first time only)"
 docker pull "$ONLYOFFICE_IMAGE" 2>&1 | indent
 ok "Image pulled"
+
+# --- Force ONLYOFFICE nginx to always emit https:// URLs ---
+#
+# The per-user Traefik proxy terminates TLS but does NOT forward
+# X-Forwarded-Proto to these containers. ONLYOFFICE's nginx therefore
+# defaults its $the_scheme map to $scheme (= http) and generates http://
+# internal asset URLs. Inside the https iframe that's a Mixed Content
+# error, which blocks the ai-agent-bridge plugin from loading — so the
+# docs-agent / sheets-agent bridges never get a connected editor.
+#
+# Fix: extract the stock http-common.conf from the image, rewrite the
+# `$the_scheme` map to a constant `https`, and bind-mount it read-only
+# into both containers (volumes added in the compose file above). The
+# host copy persists, so the patch re-applies automatically on every
+# container restart — no manual re-patching after a reboot.
+NGINX_INC="${ONLYOFFICE_DIR}/nginx/http-common.conf"
+mkdir -p "${ONLYOFFICE_DIR}/nginx"
+if [ ! -f "$NGINX_INC" ]; then
+  log "Extracting + patching nginx http-common.conf for forced HTTPS"
+  tmp_cid=$(docker create "$ONLYOFFICE_IMAGE")
+  docker cp "${tmp_cid}:/etc/onlyoffice/documentserver/nginx/includes/http-common.conf" "$NGINX_INC"
+  docker rm "$tmp_cid" >/dev/null 2>&1 || true
+  # Replace the whole `map <args> $the_scheme { ... }` block (multi-line,
+  # no nested braces) with a constant-https map. perl is always present
+  # on Ubuntu; -0777 slurps the file so the regex spans newlines.
+  perl -0777 -i -pe \
+    's/map\s+\S+\s+\$the_scheme\s*\{[^}]*\}/map \$host \$the_scheme {\n    default https;\n}/s' \
+    "$NGINX_INC"
+  if grep -q 'default https;' "$NGINX_INC"; then
+    ok "  nginx http-common.conf patched (\$the_scheme → https)"
+  else
+    warn "  nginx patch did not apply cleanly — check ${NGINX_INC}"
+  fi
+else
+  log "  nginx http-common.conf already present — leaving it"
+fi
 
 # Systemd unit so the compose stack survives reboots without depending on
 # the workspace.service or the AI-IDE backend. ExecStart= uses docker
