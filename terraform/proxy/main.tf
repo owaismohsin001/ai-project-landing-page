@@ -245,12 +245,12 @@ locals {
   })
 
   user_data = templatefile("${path.module}/user-data.sh.tftpl", {
-    traefik_yml_b64   = base64encode(local.traefik_static_yml)
+    traefik_yml_b64 = base64encode(local.traefik_static_yml)
     # Big text files are gzipped before base64 so the templatefile() doesn't
     # blow the rendered user-data past AWS's limits. Decoded with
     # `base64 -d | gunzip` in the shell script.
-    router_js_b64gz   = base64gzip(file("${path.module}/router/server.js"))
-    router_pkg_b64    = base64encode(file("${path.module}/router/package.json"))
+    router_js_b64gz = base64gzip(file("${path.module}/router/server.js"))
+    router_pkg_b64  = base64encode(file("${path.module}/router/package.json"))
     # Workspace bootstrap script — hosted here so per-user workspaces
     # don't have to embed it in their own user-data and hit AWS's 16KB cap.
     cloud_init_b64gz  = base64gzip(file("${path.module}/../workspace/cloud-init.sh"))
@@ -276,9 +276,9 @@ resource "aws_iam_role" "proxy_ssm" {
     Version = "2012-10-17"
     Statement = [
       {
-        Effect = "Allow"
+        Effect    = "Allow"
         Principal = { Service = "ec2.amazonaws.com" }
-        Action = "sts:AssumeRole"
+        Action    = "sts:AssumeRole"
       },
     ]
   })
@@ -289,6 +289,27 @@ resource "aws_iam_role" "proxy_ssm" {
 resource "aws_iam_role_policy_attachment" "proxy_ssm" {
   role       = aws_iam_role.proxy_ssm.name
   policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+}
+
+# The traefik-router resolves each ready workspace's CURRENT public DNS by
+# its stable instanceId (the publicDns/IP stored at provision time goes
+# stale on every stop/start) and writes it back to Mongo. That needs
+# read-only ec2:DescribeInstances. Scoped onto the role the proxy EC2
+# already assumes, so no extra instance profile is required.
+resource "aws_iam_role_policy" "proxy_ec2_describe" {
+  name = "${local.resource_name}-ec2-describe"
+  role = aws_iam_role.proxy_ssm.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = ["ec2:DescribeInstances"]
+        Resource = "*"
+      },
+    ]
+  })
 }
 
 resource "aws_iam_instance_profile" "proxy_ssm" {

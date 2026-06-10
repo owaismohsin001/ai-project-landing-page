@@ -41,6 +41,17 @@ if ! command -v node >/dev/null \
   apt-get install -y nodejs
 fi
 
+# ── AWS CLI v2 (the traefik-router shells out to it for the live DNS
+#    self-heal — describe-instances by instanceId). The distro 'awscli'
+#    apt package is absent on Noble, so use the official bundled installer.
+if ! command -v aws >/dev/null; then
+  apt-get install -y -qq unzip
+  curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+  unzip -oq /tmp/awscliv2.zip -d /tmp
+  /tmp/aws/install
+  rm -rf /tmp/aws /tmp/awscliv2.zip
+fi
+
 # ── traefik-router ────────────────────────────────────────────────────
 mkdir -p /opt/traefik-router/bootstrap
 echo "${router_js_b64gz}" | base64 -d | gunzip > /opt/traefik-router/server.js

@@ -23,6 +23,7 @@ const nodePath = require("node:path");
 
 const http = require("node:http");
 const { MongoClient } = require("mongodb");
+const { execFile } = require("node:child_process");
 
 const PORT = Number(process.env.PORT || 9100);
 const MONGODB_URI = process.env.MONGODB_URI;
@@ -371,6 +372,74 @@ async function registerService(userId, body) {
     body: { name, port, url: serviceUrl(name, userId) },
   };
 }
+
+// -- live DNS self-heal --------------------------------------------
+// An EC2 public DNS/IP changes on every stop/start. Instead of trusting
+// whatever publicDns was stored at provision time, every
+// DNS_SYNC_INTERVAL_MS we describe each ready user instance (keyed by
+// the STABLE instanceId) and write the live publicDns/publicIp back into
+// Mongo. buildGlobalConfig (edge routing) and the landing backend
+// /api/desktop/tunnel-grant (the desktop MCP tunnel target) both read
+// those fields, so this single loop keeps everything pointed at the right
+// box after a stop/start or an AMI relaunch -- no per-workspace secrets
+// or boot scripts required. Needs the AWS CLI on PATH and an instance
+// role granting ec2:DescribeInstances (see proxy main.tf / user-data).
+const AWS_BIN = process.env.AWS_BIN || "/usr/local/bin/aws";
+const AWS_REGION = process.env.AWS_REGION || "us-west-2";
+const DNS_SYNC_INTERVAL_MS = Number(process.env.DNS_SYNC_INTERVAL_MS || 30000);
+
+function describeInstances(instanceIds) {
+  return new Promise((resolve, reject) => {
+    const args = ["ec2", "describe-instances", "--region", AWS_REGION,
+      // --filters (not --instance-ids) so a since-terminated id does not
+      // fail the whole batch with InvalidInstanceID.NotFound.
+      "--filters", "Name=instance-id,Values=" + instanceIds.join(","),
+      "--query", "Reservations[].Instances[].[InstanceId,PublicDnsName,PublicIpAddress,State.Name]",
+      "--output", "json"];
+    execFile(AWS_BIN, args, { timeout: 15000, maxBuffer: 4 * 1024 * 1024 }, (err, stdout) => {
+      if (err) return reject(err);
+      try { resolve(JSON.parse(stdout || "[]")); } catch (e) { reject(e); }
+    });
+  });
+}
+
+async function syncWorkspaceDns() {
+  try {
+    await mongoReady;
+    const users = await db.collection("users").find(
+      { workspaceStatus: "ready", "workspace.instanceId": { $exists: true } },
+      { projection: { "workspace.instanceId": 1, "workspace.publicDns": 1, "workspace.publicIp": 1 } }
+    ).toArray();
+    const ids = users.map((u) => u.workspace && u.workspace.instanceId).filter(Boolean);
+    if (!ids.length) return;
+    const rows = await describeInstances(ids);
+    const live = new Map();
+    for (const r of rows) {
+      const iid = r[0], dns = r[1], ip = r[2], state = r[3];
+      if (state === "running" && dns) live.set(iid, { dns, ip: ip || "" });
+    }
+    let fixed = 0;
+    for (const u of users) {
+      const iid = u.workspace && u.workspace.instanceId;
+      const cur = live.get(iid);
+      if (!cur) continue;
+      if ((u.workspace.publicDns || "") !== cur.dns || (u.workspace.publicIp || "") !== cur.ip) {
+        await db.collection("users").updateOne(
+          { _id: u._id },
+          { $set: { "workspace.publicDns": cur.dns, "workspace.publicIp": cur.ip } }
+        );
+        fixed++;
+        console.log("dns-sync: " + u._id + " -> " + cur.dns + " (" + cur.ip + ")");
+      }
+    }
+    if (fixed) console.log("dns-sync: updated " + fixed + " workspace(s)");
+  } catch (err) {
+    console.error("dns-sync: failed:", err.message);
+  }
+}
+
+void syncWorkspaceDns();
+setInterval(() => { void syncWorkspaceDns(); }, DNS_SYNC_INTERVAL_MS);
 
 const server = http.createServer(async (req, res) => {
   try {
