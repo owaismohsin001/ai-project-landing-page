@@ -2,7 +2,8 @@
 # Workspace bootstrap. Rendered by Terraform's templatefile() — only the
 # named template variables (server_js_b64, package_json_b64, cloud_init_b64,
 # traefik_yml_b64, bucket_id, region, access_key_id, secret_access_key,
-# user_id, platform_domain) are substituted at apply time. All other shell
+# user_id, platform_domain, platform_api_url, workspace_provision_secret) are
+# substituted at apply time. All other shell
 # variables are written as $NAME (no curlies) to avoid Terraform trying
 # to interpolate them.
 #
@@ -71,6 +72,8 @@ PLATFORM_DOMAIN=${platform_domain}
 PLATFORM_PROTOCOL=${platform_protocol}
 PUBLIC_HOST=${user_id}.${platform_domain}
 PROXY_ROUTER_URL=${proxy_router_url}
+PLATFORM_API_URL=${platform_api_url}
+WORKSPACE_PROVISION_SECRET=${workspace_provision_secret}
 OFFICE_JWT_SECRET=$OFFICE_JWT_SECRET
 # Public service URLs the Next.js frontend exposes to the browser. Written
 # here (not as Environment= in the systemd unit) so the ai-ide-frontend
@@ -107,6 +110,10 @@ export PLATFORM_DOMAIN=${platform_domain}
 export PLATFORM_PROTOCOL=${platform_protocol}
 export PUBLIC_HOST=${user_id}.${platform_domain}
 export PROXY_ROUTER_URL=${proxy_router_url}
+export PLATFORM_API_URL=${platform_api_url}
+# WORKSPACE_PROVISION_SECRET is intentionally NOT exported here — it lives only
+# in /etc/workspace.env (mode 600), which provision.sh sources as root. Keeping
+# it out of this world-readable profile.d file limits its exposure.
 export OFFICE_JWT_SECRET=$OFFICE_JWT_SECRET
 export NEXT_PUBLIC_BACKEND_URL=${platform_protocol}://api-${user_id}.${platform_domain}
 export NEXT_PUBLIC_CODE_SERVER_URL=${platform_protocol}://ide-${user_id}.${platform_domain}

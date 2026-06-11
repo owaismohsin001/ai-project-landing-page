@@ -393,6 +393,72 @@ chown "${TARGET_USER}:${TARGET_USER}" "${TARGET_HOME}/.claude/CLAUDE.md"
 ok "CLAUDE.md written with this instance's URLs"
 
 # ─────────────────────────────────────────────────────────────────────
+# Step 3b — Join the user's Headscale mesh (replaces the reverse-SSH tunnel)
+# ─────────────────────────────────────────────────────────────────────
+# Mint a per-user ephemeral auth key from the landing page, register this box
+# on the tailnet, and point the backend's PLAYWRIGHT_MCP_URL at the desktop's
+# MagicDNS name. Must run BEFORE Step 4 so ai-ide-backend picks up the new URL
+# from /etc/workspace.env on restart. A failure here is non-fatal — the
+# workspace still comes up; the Playwright/desktop integration just stays dark
+# until it's retried.
+
+hdr "Step 3b — Join Headscale mesh"
+
+# NODE must match sanitizeNode() in src/lib/headscale.ts: lowercase, [a-z0-9-]
+# only, capped at 63 chars.
+NODE="$(printf '%s' "$USER_ID" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9-' | cut -c1-63)"
+
+if [ -z "${PLATFORM_API_URL:-}" ] || [ -z "${WORKSPACE_PROVISION_SECRET:-}" ]; then
+  warn "PLATFORM_API_URL or WORKSPACE_PROVISION_SECRET unset — skipping mesh join"
+elif [ -z "$NODE" ]; then
+  warn "USER_ID did not sanitize to a usable node name — skipping mesh join"
+else
+  log "Requesting mesh auth key from ${PLATFORM_API_URL}"
+  MESH_JSON="$(curl -fsS -X POST "${PLATFORM_API_URL}/api/workspace/mesh-authkey" \
+    -H 'Content-Type: application/json' \
+    -d "{\"userId\":\"${USER_ID}\",\"provisionSecret\":\"${WORKSPACE_PROVISION_SECRET}\"}" \
+    2>&1)" && MESH_OK=1 || MESH_OK=0
+
+  if [ "$MESH_OK" != "1" ]; then
+    warn "mesh-authkey request failed: ${MESH_JSON}"
+  else
+    LOGIN_SERVER="$(printf '%s' "$MESH_JSON" | jq -r '.loginServer // empty')"
+    AUTH_KEY="$(printf '%s' "$MESH_JSON" | jq -r '.authKey // empty')"
+    MAGIC="$(printf '%s' "$MESH_JSON" | jq -r '.magicDnsSuffix // empty')"
+
+    if [ -z "$LOGIN_SERVER" ] || [ -z "$AUTH_KEY" ] || [ -z "$MAGIC" ]; then
+      warn "mesh-authkey response missing fields: ${MESH_JSON}"
+    else
+      # Guarantee a fresh machine identity for THIS instance. The AMI is baked
+      # with tailscaled enabled but no state; scrub defensively in case a future
+      # AMI ever bakes one, so instances never share a node key on the tailnet.
+      systemctl stop tailscaled 2>/dev/null || true
+      rm -f /var/lib/tailscale/tailscaled.state
+      systemctl start tailscaled 2>/dev/null || true
+      sleep 2
+
+      log "tailscale up -> ${LOGIN_SERVER} as workspace-${NODE}"
+      if tailscale up \
+        --login-server="$LOGIN_SERVER" \
+        --authkey="$AUTH_KEY" \
+        --hostname="workspace-${NODE}" \
+        --accept-dns=true \
+        --reset 2>&1 | sed 's/^/    /'; then
+
+        # Point the backend at the desktop's MCP over MagicDNS. Rewrite any
+        # prior line so re-runs stay idempotent, then restart picks it up.
+        MCP_URL="http://desktop-${NODE}.${MAGIC}:9090/"
+        sed -i '/^PLAYWRIGHT_MCP_URL=/d' /etc/workspace.env
+        echo "PLAYWRIGHT_MCP_URL=${MCP_URL}" >> /etc/workspace.env
+        ok "Mesh joined — PLAYWRIGHT_MCP_URL=${MCP_URL}"
+      else
+        warn "tailscale up failed — leaving PLAYWRIGHT_MCP_URL unset"
+      fi
+    fi
+  fi
+fi
+
+# ─────────────────────────────────────────────────────────────────────
 # Step 4 — Kick services so they pick up the new /etc/workspace.env
 # ─────────────────────────────────────────────────────────────────────
 

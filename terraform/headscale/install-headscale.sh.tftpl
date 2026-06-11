@@ -1,0 +1,131 @@
+#!/bin/bash
+# Headscale control-server bootstrap.
+#
+# Stands up a self-hosted Tailscale control plane with an embedded DERP relay
+# (so NAT'd desktops in userspace mode can reach EC2 workspaces). TLS is via
+# Headscale's built-in Let's Encrypt (HTTP-01) — which REQUIRES the public DNS
+# A record `${server_host}` -> this box's Elastic IP to exist. Until that
+# record is live the headscale service will fail to get a cert and keep
+# retrying; that is expected on first boot.
+#
+# Substituted template vars: headscale_version, server_url, server_host,
+# base_domain, api_key_ssm_param, region, seed_policy_b64. All other $NAME
+# shell vars are left untouched by Terraform.
+set -euxo pipefail
+exec > >(tee /var/log/headscale-bootstrap.log) 2>&1
+
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -y
+apt-get install -y -qq ca-certificates curl jq unzip
+
+# ── AWS CLI v2 (to publish the API key to SSM Parameter Store) ─────────
+if ! command -v aws >/dev/null; then
+  curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+  unzip -oq /tmp/awscliv2.zip -d /tmp
+  /tmp/aws/install
+  rm -rf /tmp/aws /tmp/awscliv2.zip
+fi
+
+# ── Headscale ─────────────────────────────────────────────────────────
+ARCH="$(dpkg --print-architecture)"   # amd64 / arm64
+curl -fsSL -o /tmp/headscale.deb \
+  "https://github.com/juanfont/headscale/releases/download/v${headscale_version}/headscale_${headscale_version}_linux_$ARCH.deb"
+dpkg -i /tmp/headscale.deb
+rm -f /tmp/headscale.deb
+
+install -d -m 0750 -o headscale -g headscale /var/lib/headscale
+install -d -m 0755 /etc/headscale
+
+# ── Config ────────────────────────────────────────────────────────────
+# policy.mode: database — the landing page edits per-user ACL rules through
+# the policy API (src/lib/headscale.ts ensurePolicyRule). base_domain MUST be
+# a different label from the server_url host or headscale refuses to start.
+cat > /etc/headscale/config.yaml <<EOF
+server_url: ${server_url}
+listen_addr: 0.0.0.0:443
+metrics_listen_addr: 127.0.0.1:9090
+grpc_listen_addr: 127.0.0.1:50443
+grpc_allow_insecure: false
+
+noise:
+  private_key_path: /var/lib/headscale/noise_private.key
+
+prefixes:
+  v4: 100.64.0.0/10
+  v6: fd7a:115c:a1e0::/48
+  allocation: sequential
+
+derp:
+  server:
+    enabled: true
+    region_id: 999
+    region_code: headscale
+    region_name: "Headscale Embedded DERP"
+    stun_listen_addr: 0.0.0.0:3478
+    private_key_path: /var/lib/headscale/derp_server_private.key
+    automatically_add_embedded_derp_region: true
+  urls: []
+  paths: []
+  auto_update_enabled: false
+  update_frequency: 24h
+
+disable_check_updates: true
+ephemeral_node_inactivity_timeout: 30m
+
+database:
+  type: sqlite
+  sqlite:
+    path: /var/lib/headscale/db.sqlite
+
+# Built-in Let's Encrypt. Needs port 80 reachable for the HTTP-01 challenge
+# and the public A record for ${server_host} to point at this box.
+tls_letsencrypt_hostname: ${server_host}
+tls_letsencrypt_cache_dir: /var/lib/headscale/cache
+tls_letsencrypt_challenge_type: HTTP-01
+tls_letsencrypt_listen: ":http"
+
+log:
+  level: info
+  format: text
+
+policy:
+  mode: database
+
+dns:
+  magic_dns: true
+  base_domain: ${base_domain}
+  nameservers:
+    global:
+      - 1.1.1.1
+      - 8.8.8.8
+EOF
+
+chown headscale:headscale /etc/headscale/config.yaml
+
+systemctl enable --now headscale
+
+# ── Wait for the local control socket, then seed policy + mint API key ─
+for i in $(seq 1 30); do
+  if headscale users list >/dev/null 2>&1; then break; fi
+  sleep 2
+done
+
+# Seed a known-good base policy. Headscale rejects an empty-acls policy, so we
+# anchor on a permanent placeholder user "u-base" with a harmless self-rule
+# (no real node ever joins u-base, and dst port 0 grants nothing). The landing
+# page's ensurePolicyRule() appends one real rule per user on top of this, so
+# the policy is always valid + non-empty and never in the "not found" state.
+headscale users create u-base || true
+echo "${seed_policy_b64}" | base64 -d > /etc/headscale/acl.json
+headscale policy set -f /etc/headscale/acl.json || true
+
+# Mint a long-lived API key for the landing page and stash it in SSM.
+API_KEY="$(headscale apikeys create --expiration 8760h | tail -n1)"
+aws ssm put-parameter \
+  --region "${region}" \
+  --name "${api_key_ssm_param}" \
+  --type SecureString \
+  --value "$API_KEY" \
+  --overwrite
+
+echo "headscale bootstrap complete. server_url=${server_url}"

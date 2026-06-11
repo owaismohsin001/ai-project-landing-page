@@ -50,7 +50,7 @@ export default async function DesktopAuthPage() {
 
   // Mint the 30-day desktop bearer token (Phase 6). Embedded in the
   // aiide:// deep link so the Electron app stores it on first launch and
-  // uses it to call /api/desktop/tunnel-grant. The token is refreshed
+  // uses it to call /api/desktop/mesh-grant. The token is refreshed
   // by the grant endpoint each time it's used, so active users stay
   // connected indefinitely.
   const desktopToken = await createDesktopToken(String(user._id));

@@ -194,13 +194,50 @@ export DEBIAN_FRONTEND=noninteractive
 log "Refreshing apt package index"
 apt-get update 2>&1 | indent
 
-log "Installing: curl, ca-certificates, gnupg, git, build-essential, python3, unzip"
+log "Installing: curl, ca-certificates, gnupg, git, build-essential, python3, unzip, jq"
 apt-get install -y \
   curl ca-certificates gnupg git \
-  build-essential python3 unzip 2>&1 | indent
+  build-essential python3 unzip jq 2>&1 | indent
 
 ok "Base packages installed"
 done_step "Step 1 / 9 — apt base packages"
+
+# ────────────────────────────────────────────────────────────────────
+# Step 1b — Tailscale (mesh link to the desktop's Playwright MCP)
+# ────────────────────────────────────────────────────────────────────
+# Replaces the old reverse-SSH tunnel. The EC2 joins the user's self-hosted
+# Headscale tailnet at provision time (provision.sh runs `tailscale up`) and
+# the backend reaches the desktop's in-Electron MCP server over MagicDNS.
+# Only the binary + daemon are baked here — NO `tailscale up`, or this AMI
+# would carry the source instance's node identity.
+
+hdr "Step 1b — Tailscale"
+
+if command -v tailscale >/dev/null; then
+  skip "tailscale already installed"
+else
+  . /etc/os-release
+  log "Adding Tailscale APT repo for ${VERSION_CODENAME}"
+  curl -fsSL "https://pkgs.tailscale.com/stable/ubuntu/${VERSION_CODENAME}.noarmor.gpg" \
+    -o /usr/share/keyrings/tailscale-archive-keyring.gpg
+  curl -fsSL "https://pkgs.tailscale.com/stable/ubuntu/${VERSION_CODENAME}.tailscale-keyring.list" \
+    -o /etc/apt/sources.list.d/tailscale.list
+  apt-get update 2>&1 | indent
+  log "Installing tailscale"
+  apt-get install -y tailscale 2>&1 | indent
+fi
+
+# Enable the daemon for boot, but do NOT bake a machine identity: starting
+# tailscaled writes /var/lib/tailscale/tailscaled.state with a node key, and a
+# baked key would be SHARED by every instance launched from this AMI (they'd
+# collide on the tailnet). Enable-for-boot only, then scrub any state. On a real
+# instance, provision.sh also scrubs + runs `tailscale up` with a per-user key.
+systemctl enable tailscaled 2>&1 | indent
+systemctl stop tailscaled 2>/dev/null || true
+rm -f /var/lib/tailscale/tailscaled.state
+
+ok "tailscale $(tailscale version | head -n1) installed (boot-enabled, no identity baked)"
+done_step "Step 1b — Tailscale"
 
 # ────────────────────────────────────────────────────────────────────
 # Step 2 / 9 — Node.js 20 LTS

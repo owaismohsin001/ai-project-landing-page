@@ -378,10 +378,9 @@ async function registerService(userId, body) {
 // whatever publicDns was stored at provision time, every
 // DNS_SYNC_INTERVAL_MS we describe each ready user instance (keyed by
 // the STABLE instanceId) and write the live publicDns/publicIp back into
-// Mongo. buildGlobalConfig (edge routing) and the landing backend
-// /api/desktop/tunnel-grant (the desktop MCP tunnel target) both read
-// those fields, so this single loop keeps everything pointed at the right
-// box after a stop/start or an AMI relaunch -- no per-workspace secrets
+// Mongo. buildGlobalConfig (edge routing) reads those fields, so this single
+// loop keeps edge routing pointed at the right box after a stop/start or an
+// AMI relaunch -- no per-workspace secrets
 // or boot scripts required. Needs the AWS CLI on PATH and an instance
 // role granting ec2:DescribeInstances (see proxy main.tf / user-data).
 const AWS_BIN = process.env.AWS_BIN || "/usr/local/bin/aws";

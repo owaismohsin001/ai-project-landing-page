@@ -6,7 +6,7 @@ import { SignJWT, jwtVerify } from "jose";
  * Issued by `/desktop/auth` after a successful Platform sign-in and
  * embedded in the `aiide://workspace?…&token=<jwt>` deep link. The Electron
  * app stores it in its config.json and presents it as `Authorization:
- * Bearer …` against `/api/desktop/tunnel-grant`.
+ * Bearer …` against `/api/desktop/mesh-grant`.
  *
  * Separate from the web session cookie (`SESSION_COOKIE` / `JWT_SECRET`
  * usage in `lib/auth.ts`) so we can rotate the desktop key independently

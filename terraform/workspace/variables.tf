@@ -91,6 +91,22 @@ variable "config_poll_seconds" {
   default     = 5
 }
 
+variable "platform_api_url" {
+  description = "Base URL of the landing-page API the workspace calls during provisioning (e.g. https://platform.bytescripterz.com). Used by provision.sh to fetch a Headscale mesh auth key from /api/workspace/mesh-authkey."
+  type        = string
+
+  validation {
+    condition     = can(regex("^https?://[^/]+$", var.platform_api_url))
+    error_message = "platform_api_url must be http(s)://host[:port] with no trailing path."
+  }
+}
+
+variable "workspace_provision_secret" {
+  description = "Shared server-to-server secret the workspace presents to /api/workspace/mesh-authkey to obtain a Headscale pre-auth key. Templated into /etc/workspace.env."
+  type        = string
+  sensitive   = true
+}
+
 variable "platform_protocol" {
   description = "Scheme used in service URLs (browser-facing). Set to https when the proxy's enable_https=true; http otherwise."
   type        = string

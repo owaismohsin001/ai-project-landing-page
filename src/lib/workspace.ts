@@ -397,6 +397,16 @@ export async function provisionWorkspace(
       /\/api\/traefik\/user\/?$/,
       ""
     ),
+    // Landing-page API base the workspace calls during provisioning to fetch
+    // a Headscale mesh auth key (/api/workspace/mesh-authkey). The EC2 must be
+    // able to reach this over the public internet, so it's the public platform
+    // URL, not localhost.
+    platform_api_url: (
+      process.env.PLATFORM_API_URL ||
+      process.env.NEXT_PUBLIC_APP_URL ||
+      ""
+    ).replace(/\/+$/, ""),
+    workspace_provision_secret: process.env.WORKSPACE_PROVISION_SECRET || "",
   });
 
   await reportProgress(5);

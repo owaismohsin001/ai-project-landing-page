@@ -93,22 +93,24 @@ locals {
   })
 
   user_data = templatefile("${path.module}/user-data.sh.tftpl", {
-    server_js_b64gz   = base64gzip(file("${path.module}/server/server.js"))
-    package_json_b64  = base64encode(file("${path.module}/server/package.json"))
+    server_js_b64gz  = base64gzip(file("${path.module}/server/server.js"))
+    package_json_b64 = base64encode(file("${path.module}/server/package.json"))
     # cloud-init.sh used to be base64-embedded here, but it grew past
     # what fits in AWS's 16KB user-data limit. The proxy EC2 hosts it now
     # at ${proxy_router_url}/bootstrap/cloud-init.sh, and user-data.sh
     # curls it down at boot. cloud-init.sh lives in this module so it
     # stays version-controlled with the workspace it bootstraps.
-    traefik_yml_b64   = base64encode(local.traefik_yml)
-    bucket_id         = aws_s3_bucket.workspace.bucket
-    region            = var.region
-    access_key_id     = aws_iam_access_key.workspace.id
-    secret_access_key = aws_iam_access_key.workspace.secret
-    user_id           = var.user_id
-    platform_domain   = var.platform_domain
-    platform_protocol = var.platform_protocol
-    proxy_router_url  = var.proxy_router_url
+    traefik_yml_b64            = base64encode(local.traefik_yml)
+    bucket_id                  = aws_s3_bucket.workspace.bucket
+    region                     = var.region
+    access_key_id              = aws_iam_access_key.workspace.id
+    secret_access_key          = aws_iam_access_key.workspace.secret
+    user_id                    = var.user_id
+    platform_domain            = var.platform_domain
+    platform_protocol          = var.platform_protocol
+    proxy_router_url           = var.proxy_router_url
+    platform_api_url           = var.platform_api_url
+    workspace_provision_secret = var.workspace_provision_secret
   })
 }
 
