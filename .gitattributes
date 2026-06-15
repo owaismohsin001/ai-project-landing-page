@@ -1,0 +1,14 @@
+# These render into Linux EC2 user-data / are executed by bash on the
+# instances. CRLF line endings leak stray \r into the rendered scripts —
+# e.g. a `\`-continued `--name "..."` line put a trailing CR into the
+# Headscale SSM parameter NAME, making it unreadable by its clean name.
+# Force LF so a Windows checkout can't reintroduce CRLF.
+*.sh        text eol=lf
+*.tftpl     text eol=lf
+*.bash      text eol=lf
+
+# Node services shipped to the proxy/workspaces — keep LF for the same reason.
+terraform/**/router/*.js text eol=lf
+
+# After adding/altering this file run once to normalize the working tree:
+#   git add --renormalize .

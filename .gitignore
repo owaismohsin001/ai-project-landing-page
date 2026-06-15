@@ -20,6 +20,9 @@ yarn-error.log*
 # env files
 .env
 .env*.local
+# backups/copies of env files (e.g. .env.local.bak) — also hold secrets
+.env*.bak
+.env.*.bak
 
 # typescript
 *.tsbuildinfo
