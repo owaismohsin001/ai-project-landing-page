@@ -1,0 +1,19 @@
+# Host-built artifacts must not leak into the Linux image.
+node_modules
+.next
+out
+
+# Secrets — injected at container start by docker-compose.
+.env
+.env.*
+
+# Terraform / infra is not part of the Next.js build.
+terraform
+
+# VCS / docker / logs
+.git
+.gitignore
+Dockerfile
+.dockerignore
+npm-debug.log*
+*.log
